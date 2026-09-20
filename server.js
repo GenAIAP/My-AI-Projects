@@ -169,7 +169,7 @@ async function runModelInference(options = {}) {
         const numStocks = tickers.length;
         const seqLen = meta.seq_len || 80;
         const numFeatures = 7;
-        const CHUNK_SIZE = 50; // tune this — smaller = less peak memory, more overhead
+        const CHUNK_SIZE = 30; // tune this — smaller = less peak memory, more overhead
 
         const rawMacro = new Float32Array([
             0.2 + (Math.random() - 0.5) * 0.2,
