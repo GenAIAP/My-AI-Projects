@@ -793,10 +793,15 @@ function buildPredictionHtmlReport(predictions, topPct, marketSpread, autoOpen =
             else if (data.group === 'Top Short') tagEl.className = 'badge badge-red';
             else tagEl.className = 'badge badge-neutral';
 
-            const isBullish = data.snr >= 0;
-            const primaryColor = isBullish ? '#38bdf8' : '#f43f5e';
-            const projColor = isBullish ? '#4ade80' : '#f87171';
-            const bandFill = isBullish ? 'rgba(56, 189, 248, 0.12)' : 'rgba(244, 63, 94, 0.12)';
+            // Determine direction from the actual price trajectory, not SNR
+            const projValues = data.projection.filter(v => v !== null);
+            const isRising = projValues.length >= 2
+                ? projValues[projValues.length - 1] >= projValues[0]
+                : data.expectedReturn5d >= 0;
+
+            const primaryColor = isRising ? '#38bdf8' : '#f43f5e';
+            const projColor = isRising ? '#4ade80' : '#f87171';
+            const bandFill = isRising ? 'rgba(56, 189, 248, 0.12)' : 'rgba(244, 63, 94, 0.12)';
 
             if (individualStockChartInstance) {
                 individualStockChartInstance.destroy();
