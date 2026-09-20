@@ -212,8 +212,8 @@ async function runModelInference(options = {}) {
 
         const latency = Date.now() - t0;
 
-        const muData = results.mu.data;
-        const logVarData = results.log_var.data;
+        const muData = allMu;
+        const logVarData = allLogVar;
         const stockPredictions = [];
 
         for (let i = 0; i < numStocks; i++) {
