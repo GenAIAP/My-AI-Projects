@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Abbon's AI Projects</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="wrapper">
+    <div class="top-bar">
+      <div class="status-pill" id="statusPill">
+        <span class="pulse-dot" id="pulseDot"></span>
+        <span id="statusText">Connecting...</span>
+      </div>
+    </div>
+
+    <header>
+      <h1>Abbon's AI Projects</h1>
+      <p class="subtitle">So here are my AI Projects like AI Detector stock prediction and stuff you know. And games maybe idk</p>
+      <a href="https://www.youtube.com/watch?v=hG4lT4fxj8M" style="color: white; font-weight: bold; cursor: pointer;">Free Virus</a>
+    </header>
+
+    <main class="projects-grid" id="projectsGrid">
+      <div class="project-card">
+        <div class="card-header">
+          <div class="card-icon">📈</div>
+        </div>
+        <h2 class="project-title">AI Stock Predictor</h2>
+        <p class="project-desc">I've been watching you for some time. Can't stop staring at those ocean eyes</p>
+        <div class="tags-container">
+          <span class="tech-tag">JAMS</span>
+          <span class="tech-tag">Prints Money</span>
+          <span class="tech-tag">Ocean Eyes</span>
+        </div>
+        <button class="project-btn" id="btn-stock-predictor" data-name="AI Stock Predictor" data-link="/stock_predictor.html">
+          Print Money &rarr;
+        </button>
+      </div>
+
+      <div class="project-card">
+        <div class="card-header">
+          <div class="card-icon">💬</div>
+        </div>
+        <h2 class="project-title">Socket.io Server</h2>
+        <p class="project-desc">This is just temporary Socket.io server setup but you can chat so go head if you want to but I doubt anyone is online</p>
+        <div class="tags-container">
+        </div>
+        <button class="project-btn" id="btn-agent-chat" data-name="Realtime Agent Chat" data-link="/chat.html">
+          Open Chat &rarr;
+        </button>
+      </div>
+
+      <div class="project-card">
+        <div class="card-header">
+          <div class="card-icon">Emoji</div>
+        </div>
+        <h2 class="project-title">AI Detector</h2>
+        <p class="project-desc">My Current AI Detector that's UNDER DEVELOPMENT SO DON'T JUDGE</p>
+        <div class="tags-container">
+          <span class="tech-tag">I need a GPU</span>
+          <span class="tech-tag">False Positives</span>
+          <span class="tech-tag">Creativity is all you need</span>
+        </div>
+        <button class="project-btn" id="btn-vision-tracker" data-name="Don't yk im no good for u?" data-link="https://www.youtube.com/watch?v=pbMwTqkKSps">
+          Detect Human Text &rarr;
+        </button>
+      </div>
+
+      <div class="project-card">
+        <div class="card-header">
+          <div class="card-icon">Mirror</div>
+        </div>
+        <h2 class="project-title">Cracked Mirror</h2>
+        <p class="project-desc">Stop taking mirror SO seriously guys enjoy your life and don't say something is cringe and ignore the fun in your life</p>
+        <div class="tags-container">
+        </div>
+        <button class="project-btn" id="btn-voice-studio" data-name="YOU THINK THERE IS SOMETHING HERE?">
+          idk man &rarr;
+        </button>
+      </div>
+
+      <div class="project-card">
+        <div class="card-header">
+          <div class="card-icon">HRM</div>
+        </div>
+        <h2 class="project-title">Hierarchical Reasoning Model</h2>
+        <p class="project-desc">Can't stop thinking of your ocean pearlescent diamond mind</p>
+        <div class="tags-container">
+        </div>
+        <button class="project-btn" id="btn-rl-agent" data-name="running round running round running around the corner..." data-link="https://www.youtube.com/watch?v=NI0rodDL-U8">
+          If they do it to them... then they'll do it to you. &rarr;
+        </button>
+      </div>
+
+      <div class="project-card">
+        <div class="card-header">
+          <div class="card-icon">VPN</div>
+        </div>
+        <h2 class="project-title">VPN</h2>
+        <p class="project-desc">More like a proxy server but okay</p>
+        <div class="tags-container">
+        </div>
+        <button class="project-btn" id="btn-code-copilot" data-name="Code Copilot Engine" data-link="https://nodeproxyjs.onrender.com">
+          Try the VPN and check out the admin panel at /secret &rarr;
+        </button>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    let socket = null;
+    const statusPill = document.getElementById('statusPill');
+    const statusText = document.getElementById('statusText');
+    const toastContainer = document.getElementById('toastContainer');
+
+    function showToast(msg) {
+      if (!toastContainer) return;
+      const toast = document.createElement('div');
+      toast.className = 'toast';
+      toast.textContent = msg;
+      toastContainer.appendChild(toast);
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(10px)';
+        toast.style.transition = 'all 0.3s ease';
+        setTimeout(() => toast.remove(), 300);
+      }, 3000);
+    }
+
+    try {
+      if (typeof io !== 'undefined') {
+        socket = io();
+        socket.on('connect', () => {
+          if (statusPill) statusPill.classList.add('online');
+          if (statusText) statusText.textContent = 'Live Server';
+        });
+
+        socket.on('disconnect', () => {
+          if (statusPill) statusPill.classList.remove('online');
+          if (statusText) statusText.textContent = 'Offline';
+        });
+
+        socket.on('serverEcho', (data) => {
+          if (data && data.text) {
+            showToast(data.text);
+          }
+        });
+      } else {
+        if (statusText) statusText.textContent = 'Standalone';
+      }
+    } catch (e) {
+      if (statusText) statusText.textContent = 'Offline';
+    }
+
+    document.querySelectorAll('.project-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const projectName = btn.getAttribute('data-name') || '';
+        const link = btn.getAttribute('data-link');
+
+        try {
+          if (socket && socket.connected) {
+            socket.emit('buttonClick', { project: projectName, timestamp: Date.now() });
+            socket.emit('message', 'User activated project: ' + projectName);
+          }
+        } catch (err) {}
+
+        if (projectName) {
+          showToast('Initiating: ' + projectName);
+        }
+
+        if (link) {
+          if (link.startsWith('http://') || link.startsWith('https://')) {
+            window.open(link, '_blank');
+          } else {
+            window.location.href = link;
+          }
+        }
+      });
+    });
+  </script>
+</body>
+</html>
