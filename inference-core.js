@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { prepareInferenceInputs } = require('./market-data');
 
 let ort = null;
 try {
@@ -163,34 +164,49 @@ async function runModelInference(options = {}) {
         const { session, meta } = await getInferenceSession();
         const tickers = SP500_TICKERS;
         const numStocks = tickers.length;
-        const seqLen = meta.seq_len || 80;
+        const seqLen = meta.seq_len || 60;
         const numFeatures = 7;
         const CHUNK_SIZE = options.chunkSize || 30;
 
-        const rawMacro = new Float32Array([
-            0.2 + (Math.random() - 0.5) * 0.2,
-            1.1 + (Math.random() - 0.5) * 0.4,
-            13.5 + (Math.random() - 0.5) * 2.0,
-            2.0 + (Math.random() - 0.5) * 0.5
-        ]);
-        const normMacro = normalizeTensor(rawMacro, meta.macro_mean, meta.macro_std);
+        const t0 = Date.now();
+
+        // Fetch real OHLCV data + build feature blocks for every ticker up front.
+        // This is I/O-bound (network fetches), not CPU-bound, so it doesn't add
+        // meaningful memory/CPU pressure beyond the chunked ONNX calls below.
+        const { macroVector, blocksByTicker } = await prepareInferenceInputs(tickers, seqLen);
+
+        const normMacro = normalizeTensor(macroVector, meta.macro_mean, meta.macro_std);
         const tensorMacro = new ort.Tensor('float32', normMacro, [1, 4]);
 
         const allMu = [];
         const allLogVar = [];
-        const t0 = Date.now();
+        const failedTickers = [];
 
         for (let start = 0; start < numStocks; start += CHUNK_SIZE) {
             const end = Math.min(start + CHUNK_SIZE, numStocks);
             const chunkSize = end - start;
+            const chunkTickers = tickers.slice(start, end);
 
             const rawX = new Float32Array(1 * chunkSize * seqLen * numFeatures);
-            for (let i = 0; i < rawX.length; i++) {
-                rawX[i] = (Math.random() - 0.49) * 2.4;
-            }
+            const paddingMask = new Uint8Array(1 * chunkSize);
+
+            chunkTickers.forEach((ticker, localIdx) => {
+                const block = blocksByTicker.get(ticker);
+                const off = localIdx * seqLen * numFeatures;
+                if (block) {
+                    rawX.set(block, off);
+                    paddingMask[localIdx] = 0;
+                } else {
+                    // No usable data for this ticker this run — zero-fill and
+                    // don't mark as padded, so it still gets a (low-confidence)
+                    // prediction rather than breaking the batch shape.
+                    failedTickers.push(ticker);
+                    paddingMask[localIdx] = 0;
+                }
+            });
+
             const normX = normalizeTensor(rawX, meta.feat_mean, meta.feat_std);
             const tensorX = new ort.Tensor('float32', normX, [1, chunkSize, seqLen, numFeatures]);
-            const paddingMask = new Uint8Array(1 * chunkSize);
             const tensorMask = new ort.Tensor('bool', paddingMask, [1, chunkSize]);
 
             const results = await session.run({
@@ -203,6 +219,10 @@ async function runModelInference(options = {}) {
             allLogVar.push(...results.log_var.data);
 
             await new Promise(resolve => setImmediate(resolve));
+        }
+
+        if (failedTickers.length) {
+            console.warn(`No usable market data for ${failedTickers.length} ticker(s): ${failedTickers.slice(0, 10).join(', ')}${failedTickers.length > 10 ? '…' : ''}`);
         }
 
         const latency = Date.now() - t0;
