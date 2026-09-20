@@ -160,9 +160,6 @@ async function runModelInference(options = {}) {
     if (!ort) {
         const fallback = buildFallbackPredictions(options.topPct || 0.10, 25);
         latestPredictionsResult = fallback;
-        if (options.persistHtml) {
-            generateHtmlReport(fallback.predictions, fallback.topK / fallback.universeSize || 0.10, fallback.marketSpread, options.autoOpen || false);
-        }
         return fallback;
     }
 
@@ -172,11 +169,7 @@ async function runModelInference(options = {}) {
         const numStocks = tickers.length;
         const seqLen = meta.seq_len || 80;
         const numFeatures = 7;
-
-        const rawX = new Float32Array(1 * numStocks * seqLen * numFeatures);
-        for (let i = 0; i < rawX.length; i++) {
-            rawX[i] = (Math.random() - 0.49) * 2.4;
-        }
+        const CHUNK_SIZE = 30; // tune this — smaller = less peak memory, more overhead
 
         const rawMacro = new Float32Array([
             0.2 + (Math.random() - 0.5) * 0.2,
@@ -184,25 +177,43 @@ async function runModelInference(options = {}) {
             13.5 + (Math.random() - 0.5) * 2.0,
             2.0 + (Math.random() - 0.5) * 0.5
         ]);
-        const paddingMask = new Uint8Array(1 * numStocks);
-
-        const normX = normalizeTensor(rawX, meta.feat_mean, meta.feat_std);
         const normMacro = normalizeTensor(rawMacro, meta.macro_mean, meta.macro_std);
-
-        const tensorX = new ort.Tensor('float32', normX, [1, numStocks, seqLen, numFeatures]);
         const tensorMacro = new ort.Tensor('float32', normMacro, [1, 4]);
-        const tensorMask = new ort.Tensor('bool', paddingMask, [1, numStocks]);
 
+        const allMu = [];
+        const allLogVar = [];
         const t0 = Date.now();
-        const results = await session.run({
-            x: tensorX,
-            macro_x: tensorMacro,
-            padding_mask: tensorMask
-        });
+
+        for (let start = 0; start < numStocks; start += CHUNK_SIZE) {
+            const end = Math.min(start + CHUNK_SIZE, numStocks);
+            const chunkSize = end - start;
+
+            const rawX = new Float32Array(1 * chunkSize * seqLen * numFeatures);
+            for (let i = 0; i < rawX.length; i++) {
+                rawX[i] = (Math.random() - 0.49) * 2.4;
+            }
+            const normX = normalizeTensor(rawX, meta.feat_mean, meta.feat_std);
+            const tensorX = new ort.Tensor('float32', normX, [1, chunkSize, seqLen, numFeatures]);
+            const paddingMask = new Uint8Array(1 * chunkSize);
+            const tensorMask = new ort.Tensor('bool', paddingMask, [1, chunkSize]);
+
+            const results = await session.run({
+                x: tensorX,
+                macro_x: tensorMacro,
+                padding_mask: tensorMask
+            });
+
+            allMu.push(...results.mu.data);
+            allLogVar.push(...results.log_var.data);
+
+            // let GC breathe between chunks
+            await new Promise(resolve => setImmediate(resolve));
+        }
+
         const latency = Date.now() - t0;
 
-        const muData = results.mu.data;
-        const logVarData = results.log_var.data;
+        const muData = allMu;
+        const logVarData = allLogVar;
         const stockPredictions = [];
 
         for (let i = 0; i < numStocks; i++) {
