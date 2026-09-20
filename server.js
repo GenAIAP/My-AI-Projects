@@ -64,6 +64,19 @@ io.on('connection', (socket) => {
     id: socket.id
   });
 
+  socket.on('requestPredictions', async () => {
+    try {
+      let result = getLatestPredictions();
+      if (!result) {
+        result = await runModelInference({ autoOpen: false, persistHtml: false });
+      }
+      socket.emit('predictionsUpdated', result);
+    } catch (err) {
+      console.error('requestPredictions failed:', err.message || err);
+      socket.emit('predictionsError', { error: err.message || 'Unable to load stock predictions' });
+    }
+  });
+
   socket.on('message', (data) => {
     console.log(`Received message from ${socket.id}:`, data);
     io.emit('message', {
@@ -92,6 +105,6 @@ const HOST = '0.0.0.0'
 server.listen(PORT, HOST, () => {
   console.log(`Socket.IO server running on port ${PORT}`);
   setImmediate(() => {
-    //initializePredictor();
+    initializePredictor();
   });
 });
