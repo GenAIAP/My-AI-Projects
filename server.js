@@ -45,11 +45,15 @@ app.post('/api/run-inference', async (req, res) => {
 
 app.get('/api/stock-forecast/:ticker', async (req, res) => {
   try {
-    const result = await getStockForecast(req.params.ticker);
+    let result = getLatestPredictions();
     if (!result) {
+      result = await runModelInference({ autoOpen: false, persistHtml: false });
+    }
+    const forecast = await getStockForecast(req.params.ticker);
+    if (!forecast) {
       return res.status(404).json({ error: 'No stock forecast available yet' });
     }
-    return res.json(result);
+    return res.json(forecast);
   } catch (err) {
     console.error('Stock forecast request failed:', err.message || err);
     return res.status(500).json({ error: 'Unable to load stock forecast data' });
