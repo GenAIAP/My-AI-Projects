@@ -197,8 +197,8 @@
   <div class="container">
     <header>
       <div class="title-group">
-        <h1>Socket.IO Server</h1>
-        <p>Live WebSocket Communication Test</p>
+        <h1>Live Chat</h1>
+        <p>Set your name and keep the conversation history</p>
       </div>
       <div class="status-badge" id="statusBadge">
         <span class="status-dot" id="statusDot"></span>
@@ -211,10 +211,15 @@
       <span>Transport: <strong id="transport">N/A</strong></span>
     </div>
 
+    <div class="input-row" style="margin-bottom: 1rem;">
+      <input type="text" id="nameInput" placeholder="Your name" autocomplete="off" />
+      <button type="button" id="setNameBtn">Set Name</button>
+    </div>
+
     <div class="events-panel" id="eventsPanel"></div>
 
     <form class="input-row" id="messageForm">
-      <input type="text" id="messageInput" placeholder="Type a message to emit..." autocomplete="off" required />
+      <input type="text" id="messageInput" placeholder="Type a message..." autocomplete="off" required />
       <button type="submit" id="sendBtn">Send</button>
     </form>
   </div>
@@ -229,25 +234,55 @@
     const eventsPanel = document.getElementById('eventsPanel');
     const messageForm = document.getElementById('messageForm');
     const messageInput = document.getElementById('messageInput');
+    const nameInput = document.getElementById('nameInput');
+    const setNameBtn = document.getElementById('setNameBtn');
 
-    function logEvent(type, title, payload) {
+    const storageKey = 'chat-user-name';
+    const historyKey = 'chat-message-history';
+
+    let currentUserName = localStorage.getItem(storageKey) || 'Guest';
+
+    function formatTime(timestamp) {
+      return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function persistHistory(messages) {
+      localStorage.setItem(historyKey, JSON.stringify(messages.slice(-100)));
+    }
+
+    function renderMessage(entry) {
+      if (!entry) return;
+      const text = entry.text || entry.message || '';
+      if (!text) return;
+
       const el = document.createElement('div');
-      el.className = 'event-item ' + type;
-      const now = new Date().toLocaleTimeString();
-      let message = ""
-      if (typeof payload === 'object') {
-        if (payload.message) message = payload.message;
-        else if (payload.data) message = payload.data;
-        else message = JSON.stringify(payload);
-      } else {
-        message = payload;
-      }
-      if (message)
-      el.innerHTML = '<div class="event-meta">[' + now + '] ' + title + '</div>' + 
-        '<div>' + message + '</div>';
-      console.log(payload)
+      const isSystem = entry.type === 'system';
+      el.className = 'event-item ' + (isSystem ? 'system' : 'broadcast');
+      const label = isSystem ? 'System' : (entry.name || 'Guest');
+      const time = formatTime(entry.timestamp || Date.now());
+      const content = isSystem ? entry.message : entry.text;
+      el.innerHTML = '<div class="event-meta">[' + time + '] ' + label + '</div><div>' + content + '</div>';
       eventsPanel.appendChild(el);
       eventsPanel.scrollTop = eventsPanel.scrollHeight;
+    }
+
+    function loadLocalHistory() {
+      try {
+        const stored = JSON.parse(localStorage.getItem(historyKey) || '[]');
+        if (Array.isArray(stored)) {
+          stored.forEach((entry) => renderMessage(entry));
+        }
+      } catch (err) {
+        console.warn('Unable to parse chat history', err);
+      }
+    }
+
+    function applyName(name) {
+      const cleanName = String(name || '').trim().slice(0, 24) || 'Guest';
+      currentUserName = cleanName;
+      localStorage.setItem(storageKey, cleanName);
+      nameInput.value = cleanName;
+      socket.emit('setName', cleanName);
     }
 
     socket.on('connect', () => {
@@ -255,19 +290,58 @@
       statusText.textContent = 'Connected';
       socketIdSpan.textContent = socket.id;
       transportSpan.textContent = socket.io.engine.transport.name;
-      logEvent('system', 'Connection Established', 'Connected with ID: ' + socket.id);
+      applyName(currentUserName);
 
       socket.io.engine.on('upgrade', () => {
         transportSpan.textContent = socket.io.engine.transport.name;
       });
     });
 
-    socket.on('welcome', (data) => {
-      logEvent('system', 'Event: welcome', data);
+    socket.on('nameSet', (data) => {
+      const name = data?.name || currentUserName;
+      currentUserName = name;
+      localStorage.setItem(storageKey, name);
+      nameInput.value = name;
+    });
+
+    socket.on('chatHistory', (history) => {
+      if (!Array.isArray(history)) return;
+      eventsPanel.innerHTML = '';
+      history.forEach((entry) => renderMessage(entry));
+      persistHistory(history);
     });
 
     socket.on('message', (data) => {
-      logEvent('broadcast', 'Event: message', data);
+      const message = {
+        type: 'chat',
+        name: data?.name || 'Guest',
+        text: String(data?.text || data?.message || '').trim(),
+        timestamp: data?.timestamp || Date.now()
+      };
+
+      if (!message.text) return;
+
+      const existing = JSON.parse(localStorage.getItem(historyKey) || '[]');
+      const next = [...existing, message].slice(-100);
+      persistHistory(next);
+
+      renderMessage(message);
+    });
+
+    socket.on('systemMessage', (data) => {
+      const message = {
+        type: 'system',
+        message: data?.message || 'System update',
+        timestamp: data?.timestamp || Date.now()
+      };
+      renderMessage(message);
+      const existing = JSON.parse(localStorage.getItem(historyKey) || '[]');
+      const next = [...existing, message].slice(-100);
+      persistHistory(next);
+    });
+
+    socket.on('welcome', (data) => {
+      renderMessage({ type: 'system', message: data?.message || 'Connected', timestamp: Date.now() });
     });
 
     socket.on('disconnect', (reason) => {
@@ -275,16 +349,28 @@
       statusText.textContent = 'Disconnected';
       socketIdSpan.textContent = 'None';
       transportSpan.textContent = 'N/A';
-      logEvent('system', 'Disconnected', reason);
+      renderMessage({ type: 'system', message: 'Disconnected: ' + reason, timestamp: Date.now() });
     });
 
     messageForm.addEventListener('submit', (e) => {
       e.preventDefault();
       const text = messageInput.value.trim();
       if (!text) return;
-      socket.emit('message', text);
+      const payload = { name: currentUserName, text, timestamp: Date.now() };
+      socket.emit('message', payload);
       messageInput.value = '';
     });
+
+    setNameBtn.addEventListener('click', () => applyName(nameInput.value));
+    nameInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        applyName(nameInput.value);
+      }
+    });
+
+    nameInput.value = currentUserName;
+    loadLocalHistory();
   </script>
 </body>
 </html>
