@@ -259,5 +259,6 @@ async function prepareInferenceInputs(tickers, seqLen) {
 
 module.exports = {
     prepareInferenceInputs,
+    getOHLCV,
     INDEX_TICKER
 };
