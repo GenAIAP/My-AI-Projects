@@ -19,6 +19,25 @@ const io = new Server(server, {
 });
 
 let inferenceInProgress = false;
+let chatHistory = [];
+
+function normalizeName(name) {
+    const clean = String(name || '').trim();
+    if (!clean) return 'Guest';
+    return clean.slice(0, 24);
+}
+
+function normalizeMessagePayload(payload) {
+    if (typeof payload === 'string') {
+        return { name: 'Guest', text: payload, timestamp: Date.now() };
+    }
+
+    return {
+        name: normalizeName(payload?.name),
+        text: String(payload?.text || payload?.message || '').trim(),
+        timestamp: Number(payload?.timestamp) || Date.now()
+    };
+}
 
 function triggerBackgroundInference() {
     if (inferenceInProgress) return;
@@ -78,27 +97,48 @@ app.post('/api/run-inference', async (req, res) => {
 });
 
 app.get('/api/stock-forecast/:ticker', async (req, res) => {
-    try {
-        const result = getLatestPredictions();
-        if (!result) {
-            triggerBackgroundInference();
-            return res.status(202).json({ error: 'Predictions still initializing, try again shortly' });
-        }
-        const forecast = await getStockForecast(req.params.ticker, result);
-        if (!forecast) {
-            return res.status(404).json({ error: 'No stock forecast available yet' });
-        }
-        return res.json(forecast);
-    } catch (err) {
-        console.error('Stock forecast request failed:', err.message || err);
-        return res.status(500).json({ error: 'Unable to load stock forecast data' });
+  try {
+    const ticker = String(req.params.ticker || '')
+      .trim()
+      .toUpperCase();
+    const result = getLatestPredictions();
+    if (!result) {
+      triggerBackgroundInference();
+      return res
+        .status(202)
+        .json({ error: 'Predictions still initializing, try again shortly' });
     }
+    const forecast = await getStockForecast(ticker, result);
+    if (!forecast) {
+      return res
+        .status(404)
+        .json({ error: `No stock forecast available for ${ticker}` });
+    }
+    return res.json(forecast);
+  } catch (err) {
+    console.error('Stock forecast request failed:', err.message || err);
+    return res
+      .status(500)
+      .json({ error: 'Unable to load stock forecast data' });
+  }
 });
 
 io.on('connection', (socket) => {
     console.log(`Client connected: ${socket.id}`);
 
     socket.emit('welcome', { message: 'Connected to Socket.IO server', id: socket.id });
+    socket.emit('chatHistory', chatHistory);
+
+    socket.on('setName', (name) => {
+        const cleanName = normalizeName(name);
+        socket.data.name = cleanName;
+        socket.emit('nameSet', { name: cleanName });
+        io.emit('systemMessage', {
+            type: 'system',
+            message: `${cleanName} joined the chat`,
+            timestamp: Date.now()
+        });
+    });
 
     socket.on('requestPredictions', () => {
         const result = getLatestPredictions();
@@ -110,9 +150,19 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('message', (data) => {
-        console.log(`Received message from ${socket.id}:`, data);
-        io.emit('message', { sender: socket.id, data, timestamp: new Date().toISOString() });
+    socket.on('message', (payload) => {
+        const message = normalizeMessagePayload(payload);
+        if (!message.text) return;
+
+        const finalMessage = {
+            name: message.name || socket.data.name || 'Guest',
+            text: message.text,
+            timestamp: message.timestamp || Date.now(),
+            senderId: socket.id
+        };
+
+        chatHistory = [...chatHistory, finalMessage].slice(-100);
+        io.emit('message', finalMessage);
     });
 
     socket.on('disconnect', (reason) => {
