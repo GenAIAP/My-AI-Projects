@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 
-const { runInference, getLatestPredictions } = require('./inference-manager');
+const { runInference, getLatestPredictions } = require('./ai-stock-predictor');
 const { getStockForecast } = require('./forecast-utils');
 const { buildPredictionHtmlReport } = require('./html-report');
 
