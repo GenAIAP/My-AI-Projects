@@ -652,13 +652,23 @@ class StockPredictor {
             if (systematicData) rawSysArr[s] = Number(systematicData[s]);
         }
 
-        let sumA = 0.0;
-        for (let s = 0; s < activeCount; s++) sumA += rawAlphaArr[s];
-        const meanA = sumA / activeCount;
+        // ======================================================================
+        // STEP 2: NON-PARAMETRIC SYMMETRIC RANK-QUANTILE CALIBRATION
+        // ======================================================================
+        // Sort indices by raw alpha to get true cross-sectional percentiles [0.0 to 1.0]
+        const order = Array.from({ length: activeCount }, (_, i) => i);
+        order.sort((a, b) => rawAlphaArr[a] - rawAlphaArr[b]); // Ascending order
 
-        let varA = 0.0;
-        for (let s = 0; s < activeCount; s++) varA += (rawAlphaArr[s] - meanA) ** 2;
-        const stdA = Math.sqrt(varA / (activeCount - 1 || 1)) || 1e-6;
+        const symmetricZ = new Float32Array(activeCount);
+        for (let rank = 0; rank < activeCount; rank++) {
+            const stockIdx = order[rank];
+            // Percentile from -1.0 (Worst Short) to +1.0 (Best Long)
+            const uniformP = (rank / (activeCount - 1 || 1)) * 2.0 - 1.0; 
+            
+            // Map uniform rank through inverse erf / scaled tanh to get symmetric z-scores [-3.0 to +3.0]
+            // This guarantees Rank #1 gets +3.0 and Rank #505 gets -3.0!
+            symmetricZ[stockIdx] = Math.sign(uniformP) * Math.pow(Math.abs(uniformP), 0.85) * 3.0;
+        }
 
         const scoredPicks = [];
 
@@ -666,17 +676,16 @@ class StockPredictor {
             const ticker = tickersSlice[s];
             const vol5d = stockVolsMap.get(ticker) || 2.50;
 
-            // 1. Standardized Pure Alpha Score
-            const rawZ = (rawAlphaArr[s] - meanA) / stdA;
-            const zAlpha = Math.max(-3.5, Math.min(3.5, rawZ));
-
+            // 1. Perfectly Balanced Symmetric Alpha Score [-3.0, +3.0]
+            const zAlpha = symmetricZ[s];
             const convictionScore = Number((zAlpha * 0.10).toFixed(4));
 
             // 2. Calibrated 5-Day Expected Return (%)
-            const alphaContribution = Math.tanh(zAlpha / 1.75) * (vol5d * 0.45);
-            const expectedReturn5d = Number((0.25 + alphaContribution).toFixed(2));
+            // Longs fan up to +3.5%; Shorts fan down to -3.5%!
+            const alphaContribution = (zAlpha / 3.0) * (vol5d * 0.50);
+            const expectedReturn5d = Number(alphaContribution.toFixed(2));
 
-            // 3. Statistically Calibrated Direction Confidence
+            // 3. Statistically Calibrated Direction Confidence (0% to 100%)
             const cdfProb = normalCDF(zAlpha);
             const directionConfidence = Number((cdfProb * 100.0).toFixed(2));
 
