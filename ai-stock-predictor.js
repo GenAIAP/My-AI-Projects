@@ -937,6 +937,7 @@ async function prepareInferenceInputs(universeTickers, lookback = LOOKBACK, opti
 
     const stockDataMap = new Map();
     const stockVolsMap = new Map();
+    const stockPricesMap = new Map();
 
     for (const ticker of universeTickers) {
         const series = rawSeriesMap.get(ticker);
@@ -945,7 +946,7 @@ async function prepareInferenceInputs(universeTickers, lookback = LOOKBACK, opti
         const processed = computeStationaryFactors(series, spy5dReturnMap);
         if (!processed) continue;
 
-        const { factorsByDate, stockVol5d } = processed;
+        const { factorsByDate, stockVol5d, lastClose } = processed;
         if (!factorsByDate.has(activeSignalDate)) continue;
 
         const seq = new Float32Array(lookback * NUM_FEATURES);
@@ -967,6 +968,7 @@ async function prepareInferenceInputs(universeTickers, lookback = LOOKBACK, opti
         if (missingCount <= 5 && lastValidRow !== null) {
             stockDataMap.set(ticker, seq);
             stockVolsMap.set(ticker, stockVol5d);
+            stockPricesMap.set(ticker, lastClose);
         }
     }
 
@@ -1003,6 +1005,7 @@ async function prepareInferenceInputs(universeTickers, lookback = LOOKBACK, opti
         targetDates,
         stockDataMap,
         stockVolsMap,
+        stockPricesMap,
         macroVector,
         spyMom20
     };
@@ -1294,7 +1297,7 @@ async function buildAndRunPredictor(options = {}) {
     const activeUniverse = SP500_TICKERS.filter(t => !DEAD_TICKERS.has(t));
     console.log(`[InferencePipeline] Preparing point-in-time factor matrices for ${activeUniverse.length} S&P 500 instruments...`);
 
-    const { targetDates, stockDataMap, stockVolsMap, macroVector, spyMom20 } = await prepareInferenceInputs(
+    const { targetDates, stockDataMap, stockVolsMap, stockPricesMap, macroVector, spyMom20 } = await prepareInferenceInputs(
         activeUniverse,
         LOOKBACK,
         options
@@ -1329,6 +1332,7 @@ async function buildAndRunPredictor(options = {}) {
     const predictions = ranked.map(item => ({
         ticker: item.ticker,
         sector: item.sector,
+        price: stockPricesMap.get(item.ticker) || null,
         snr: item.score,
         expectedReturn5d: item.expectedReturn5d,
         uncertainty5d: item.uncertainty5d,
