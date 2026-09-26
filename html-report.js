@@ -1,653 +1,523 @@
-// File: html-report.js
-// ==============================================================================
-// S&P 500 AI QUANT PREDICTIONS DASHBOARD (HTML REPORT GENERATOR - V5.2)
-// Institutional Telemetry & Visualization Interface:
-//   - Delegated Event Listeners (Zero Inline Quote-Escaping Bugs)
-//   - Model-Aligned Group Badges (Top Long, Top Short, Neutral via p.group)
-//   - Complete Directional Telemetry (Direction, Confidence %, SNR, Uncertainty)
-//   - Interactive Multi-Column Table Sorting (Rank, Ticker, SNR, Ret, Uncertainty)
-//   - Persistent Search Filtering across Live Socket Ingestion
-//   - Dual-Horizon Uncertainty Projections with Chart.js
-// ==============================================================================
+require('dotenv').config();
 
-function buildPredictionHtmlReport(dataOrPredictions, topPctArg = 0.10, marketSpreadArg = 0) {
-    // Normalization to support either full result object or legacy parameter list
-    let predictions = [];
-    let topPct = 0.10;
-    let marketSpread = 0;
-    let macroState = { dispersion: 0, meanReturn: 0, meanHLSpread: 0, meanNormVol: 0 };
-    let signalDate = new Date().toISOString().split('T')[0];
+const express = require('express');
+const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const path = require('path');
 
-    if (dataOrPredictions && Array.isArray(dataOrPredictions.predictions)) {
-        predictions = dataOrPredictions.predictions;
-        topPct = dataOrPredictions.topK ? (dataOrPredictions.topK / (dataOrPredictions.universeSize || predictions.length)) : 0.10;
-        marketSpread = Number(dataOrPredictions.marketSpread) || 0;
-        if (dataOrPredictions.macroState) macroState = dataOrPredictions.macroState;
-        if (dataOrPredictions.signalDate) signalDate = dataOrPredictions.signalDate;
-    } else if (Array.isArray(dataOrPredictions)) {
-        predictions = dataOrPredictions;
-        topPct = Number(topPctArg) || 0.10;
-        marketSpread = Number(marketSpreadArg) || 0;
+const { runInference, getLatestPredictions } = require('./ai-stock-predictor');
+const { getStockForecast } = require('./forecast-utils');
+const { buildPredictionHtmlReport } = require('./html-report');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+
+const adminCredentials = JSON.parse(process.env.ADMIN_CREDENTIALS || '{}');
+const sessionSecret = process.env.ADMIN_SESSION_SECRET;
+const adminCookieName = 'admin_session';
+const adminSessionDuration = 8 * 60 * 60 * 1000;
+const adminBanStorePath = path.join(__dirname, '.admin-bans.json');
+const activeBans = new Map();
+const adminSites = [
+    { path: '/', label: 'Home' },
+    { path: '/chat.html', label: 'Chat' },
+    { path: '/stock_predictor.html', label: 'Stock Predictor' },
+    { path: '/results_chart.html', label: 'Results Chart' }
+];
+const adminSitePaths = new Set(adminSites.map(site => site.path));
+
+try {
+    const storedBans = JSON.parse(fs.readFileSync(adminBanStorePath, 'utf8'));
+    for (const [address, expiresAt] of Object.entries(storedBans)) {
+        if (Number.isFinite(expiresAt) && expiresAt > Date.now()) activeBans.set(address, expiresAt);
     }
-
-    const topK = Math.max(1, Math.ceil(predictions.length * topPct));
-
-    const topTails = [...predictions.slice(0, 15), ...predictions.slice(-15)];
-    const tailLabels = JSON.stringify(topTails.map(p => p.ticker));
-    const tailSnr = JSON.stringify(topTails.map(p => Number((p.snr || 0).toFixed(4))));
-    const tailColors = JSON.stringify(topTails.map((p, i) => i < 15 ? 'rgba(34, 197, 94, 0.85)' : 'rgba(239, 68, 68, 0.85)'));
-
-    const scatterData = JSON.stringify(predictions.map(p => ({
-        x: Number((p.uncertainty5d || 0).toFixed(2)),
-        y: Number((p.expectedReturn5d || 0).toFixed(2)),
-        ticker: p.ticker,
-        snr: Number((p.snr || 0).toFixed(4))
-    })));
-
-    const initialStock = predictions.length > 0 ? predictions[0] : {
-        ticker: 'SPY',
-        snr: 0,
-        expectedReturn5d: 0,
-        uncertainty5d: 1.5,
-        direction: 'Neutral',
-        directionConfidence: 50.0,
-        group: 'Neutral',
-        rank: 1
-    };
-
-    const tableRowsHtml = predictions.map((p, idx) => {
-        const rank = p.rank || (idx + 1);
-        const snr = Number(p.snr || 0);
-        const expRet = Number(p.expectedReturn5d || 0);
-        const unc = Number(p.uncertainty5d || 0);
-        const dir = p.direction || (snr >= 0 ? 'Bullish' : 'Bearish');
-        const dirConf = Number(p.directionConfidence || 50.0);
-        const group = p.group || (idx < topK && expRet > 0 ? 'Top Long' : (idx >= predictions.length - topK && expRet < 0 ? 'Top Short' : 'Neutral'));
-
-        let badgeClass = 'badge-neutral';
-        if (group === 'Top Long') badgeClass = 'badge-green';
-        else if (group === 'Top Short') badgeClass = 'badge-red';
-
-        let dirIcon = '●';
-        let dirColor = '#94a3b8';
-        if (dir === 'Bullish') { dirIcon = '▲'; dirColor = '#4ade80'; }
-        else if (dir === 'Bearish') { dirIcon = '▼'; dirColor = '#f87171'; }
-
-        const portfolioWeight = Number(p.portfolioWeight) || 0;
-        const price = Number(p.price) || 0;
-        const suggestedShares = portfolioWeight > 0 && price > 0
-            ? Math.floor((10000 * portfolioWeight) / price)
-            : null;
-        const shareLabel = suggestedShares === null
-            ? 'No buy'
-            : (suggestedShares > 0 ? `Buy ${suggestedShares} shares` : 'Buy <1 share');
-
-        return `<tr data-ticker="${p.ticker}">
-            <td><strong>#${rank}</strong></td>
-            <td><strong style="color: #38bdf8;">${p.ticker}</strong><span class="ticker-recommendation suggested-shares" data-weight="${portfolioWeight}" data-price="${price}">${shareLabel}</span></td>
-            <td style="color:${dirColor}; font-weight: 600;">${dirIcon} ${dir} <span style="font-size: 11px; color: #94a3b8;">(${dirConf.toFixed(1)}%)</span></td>
-            <td style="color:${snr >= 0 ? '#4ade80' : '#f87171'}; font-weight: bold;">${snr >= 0 ? '+' : ''}${snr.toFixed(4)}</td>
-            <td style="color:${expRet >= 0 ? '#4ade80' : '#f87171'}; font-weight: bold;">${expRet >= 0 ? '+' : ''}${expRet.toFixed(2)}%</td>
-            <td style="color: #cbd5e1;">&plusmn;${unc.toFixed(2)}%</td>
-            <td><span class="badge ${badgeClass}">${group}</span></td>
-            <td><button class="btn-micro btn-forecast-trigger" data-ticker="${p.ticker}">Forecast</button></td>
-        </tr>`;
-    }).join('\n');
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>S&P 500 AI Quant Factor Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="/socket.io/socket.io.js"></script>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0b0f19; color: #f1f5f9; padding: 25px; margin: 0; }
-        .container { max-width: 1440px; margin: 0 auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 15px; }
-        .header-left { display: flex; align-items: center; gap: 15px; }
-        .back-link { color: #94a3b8; text-decoration: none; font-size: 14px; padding: 6px 12px; background: #1e293b; border-radius: 8px; border: 1px solid #334155; transition: all 0.2s; }
-        .back-link:hover { color: #fff; background: #334155; }
-        h1 { font-size: 24px; color: #38bdf8; margin: 0; }
-        .header-actions { display: flex; align-items: center; gap: 12px; }
-        .btn-action { background: #6366f1; color: white; border: none; padding: 8px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: all 0.2s; font-size: 14px; }
-        .btn-action:hover { background: #4f46e5; transform: translateY(-1px); }
-        .btn-action:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 25px; }
-        .stat-card { background: #1e293b; border-radius: 10px; padding: 18px; border: 1px solid #334155; }
-        .stat-label { color: #94a3b8; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .stat-val { font-size: 24px; font-weight: bold; margin-top: 5px; color: #f8fafc; }
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 25px; }
-        .card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
-        .card-title { font-size: 16px; font-weight: 600; margin-bottom: 12px; color: #e2e8f0; display: flex; justify-content: space-between; align-items: center; }
-        .badge { padding: 4px 9px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px; }
-        .badge-green { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.4); }
-        .badge-red { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
-        .badge-neutral { background: rgba(148, 163, 184, 0.2); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.4); }
-        .search-box { width: 100%; padding: 10px 15px; background: #0f172a; border: 1px solid #475569; border-radius: 8px; color: #fff; box-sizing: border-box; margin-bottom: 15px; font-size: 13px; }
-        .search-box:focus { outline: none; border-color: #38bdf8; }
-        .table-container { max-height: 480px; overflow-y: auto; border: 1px solid #334155; border-radius: 8px; }
-        .ticker-recommendation { display: block; color: #4ade80; font-size: 11px; font-weight: 600; margin-top: 3px; white-space: nowrap; }
-        .portfolio-budget-control { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin: 2px 0 12px; color: #cbd5e1; font-size: 13px; font-weight: 600; }
-        .portfolio-budget-control input { width: 130px; padding: 8px 10px; background: #0f172a; border: 1px solid #64748b; border-radius: 4px; color: #fff; font-size: 14px; }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
-        th { background: #0f172a; padding: 11px 12px; color: #94a3b8; position: sticky; top: 0; z-index: 2; user-select: none; cursor: pointer; }
-        th:hover { color: #f8fafc; }
-        td { padding: 10px 12px; border-bottom: 1px solid #1e293b; background: #131c2e; }
-        tr:hover td { background: #1e293b; cursor: pointer; }
-        .btn-micro { background: #38bdf8; color: #0b0f19; border: none; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: bold; cursor: pointer; transition: all 0.15s; }
-        .btn-micro:hover { background: #7dd3fc; transform: scale(1.04); }
-        .stock-selector-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; }
-        .stock-chips { display: flex; gap: 6px; flex-wrap: wrap; }
-        .chip { background: #0f172a; border: 1px solid #475569; color: #94a3b8; padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: bold; transition: all 0.15s; }
-        .chip:hover, .chip.active { background: #6366f1; color: white; border-color: #6366f1; }
-        .stock-stat-badge { background: #0f172a; padding: 8px 14px; border-radius: 8px; border: 1px solid #334155; display: inline-flex; flex-direction: column; min-width: 105px; }
-        .stock-stat-badge .sub { font-size: 10px; color: #94a3b8; text-transform: uppercase; font-weight: 600; margin-bottom: 2px; }
-        .stock-stat-badge .val { font-size: 14px; font-weight: bold; color: #fff; }
-        .stock-info-strip { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 15px; padding-bottom: 12px; border-bottom: 1px solid #334155; }
-        .toast-notify { position: fixed; bottom: 20px; right: 20px; background: #1e293b; border: 1px solid #6366f1; color: #fff; padding: 12px 20px; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); z-index: 1000; opacity: 0; transform: translateY(10px); transition: all 0.3s; pointer-events: none; }
-        .toast-notify.visible { opacity: 1; transform: translateY(0); }
-        @media (max-width: 900px) {
-            .stats-grid { grid-template-columns: 1fr 1fr; }
-            .grid-2 { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <div class="header-left">
-                <a href="/" class="back-link">&larr; Main Menu</a>
-                <div>
-                    <h1>📈 S&P 500 Spatio-Temporal Factor Alpha Engine (V5.2)</h1>
-                    <div style="color: #94a3b8; font-size: 13px; margin-top: 4px;">
-                        ResNet-TCN + 6-Layer SDPA Transformer | As of Session: <strong>${signalDate}</strong> | Universe: <span id="headerUniverseCount">${predictions.length}</span> Assets
-                    </div>
-                </div>
-            </div>
-            <div class="header-actions">
-                <button class="btn-action" id="btnUpdateModel" onclick="updateModel()">
-                    <span id="updateIcon">⚡</span>
-                    <span id="updateLabel">Re-Run Model Inference</span>
-                </button>
-                <span class="badge badge-green" id="serverBadge" style="font-size: 12px; padding: 7px 12px;">LIVE SERVER</span>
-            </div>
-        </div>
-
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Active Universe</div>
-                <div class="stat-val" id="statUniverse">${predictions.length} Stocks</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Market Conviction Spread</div>
-                <div class="stat-val" id="statSpread" style="color: #38bdf8;">${marketSpread.toFixed(4)}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Target Long Basket</div>
-                <div class="stat-val" id="statTargetLong" style="color: #4ade80;">${topK} Stocks</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Target Short Basket</div>
-                <div class="stat-val" id="statTargetShort" style="color: #f87171;">${topK} Stocks</div>
-            </div>
-        </div>
-
-        <div class="card" style="margin-bottom: 25px;">
-            <div class="card-title">
-                <span>🎯 Asset Direction &amp; Multi-Horizon Forward Trajectory</span>
-                <span id="selectedStockTag" class="badge badge-green" style="font-size: 12px;">${initialStock.group.toUpperCase()}</span>
-            </div>
-
-            <div class="stock-selector-row">
-                <div style="font-size: 13px; color: #94a3b8; font-weight: bold;">Quick Select:</div>
-                <div class="stock-chips" id="quickSelectChips">
-                    <span class="chip active" data-ticker="${initialStock.ticker}">${initialStock.ticker}</span>
-                    <span class="chip" data-ticker="NVDA">NVDA</span>
-                    <span class="chip" data-ticker="AAPL">AAPL</span>
-                    <span class="chip" data-ticker="TSLA">TSLA</span>
-                    <span class="chip" data-ticker="MSFT">MSFT</span>
-                    <span class="chip" data-ticker="AMZN">AMZN</span>
-                    <span class="chip" data-ticker="GOOGL">GOOGL</span>
-                    <span class="chip" data-ticker="META">META</span>
-                    <span class="chip" data-ticker="JPM">JPM</span>
-                </div>
-                <div style="display: flex; align-items: center; gap: 8px; margin-left: auto;">
-                    <input type="text" id="customTickerInput" placeholder="Enter Ticker (e.g. AMD)..." style="background:#0f172a; border:1px solid #475569; color:#fff; padding:6px 12px; border-radius:6px; font-size:12px; width:170px; text-transform:uppercase;">
-                    <button class="btn-micro" style="padding: 6px 14px; font-size: 12px; height: 31px;" onclick="searchCustomStock()">Forecast &rarr;</button>
-                </div>
-            </div>
-
-            <div class="stock-info-strip">
-                <div class="stock-stat-badge">
-                    <span class="sub">Instrument</span>
-                    <span class="val" id="detailTicker" style="color: #38bdf8;">${initialStock.ticker}</span>
-                </div>
-                <div class="stock-stat-badge">
-                    <span class="sub">5D Direction</span>
-                    <span class="val" id="detailDirection" style="color: ${initialStock.direction === 'Bearish' ? '#f87171' : '#4ade80'};">
-                        ${initialStock.direction === 'Bearish' ? '▼' : '▲'} ${initialStock.direction} (${Number(initialStock.directionConfidence || 50).toFixed(1)}%)
-                    </span>
-                </div>
-                <div class="stock-stat-badge">
-                    <span class="sub">Composite SNR</span>
-                    <span class="val" id="detailSnr" style="color: ${initialStock.snr >= 0 ? '#4ade80' : '#f87171'};">
-                        ${initialStock.snr >= 0 ? '+' : ''}${Number(initialStock.snr || 0).toFixed(4)}
-                    </span>
-                </div>
-                <div class="stock-stat-badge">
-                    <span class="sub">Expected 5D Return</span>
-                    <span class="val" id="detailReturn" style="color: ${initialStock.expectedReturn5d >= 0 ? '#4ade80' : '#f87171'};">
-                        ${initialStock.expectedReturn5d >= 0 ? '+' : ''}${Number(initialStock.expectedReturn5d || 0).toFixed(2)}%
-                    </span>
-                </div>
-                <div class="stock-stat-badge">
-                    <span class="sub">Uncertainty (σ)</span>
-                    <span class="val" id="detailUncertainty">&plusmn;${Number(initialStock.uncertainty5d || 0).toFixed(2)}%</span>
-                </div>
-                <div class="stock-stat-badge">
-                    <span class="sub">Factor Rank</span>
-                    <span class="val" id="detailRank">#${initialStock.rank || 1}</span>
-                </div>
-            </div>
-
-            <canvas id="individualStockChart" height="100"></canvas>
-        </div>
-
-        <div class="grid-2">
-            <div class="card">
-                <div class="card-title">1. S&P 500 Factor Risk vs. Return Cross-Section (${predictions.length} Stocks)</div>
-                <canvas id="scatterChart" height="230"></canvas>
-            </div>
-            <div class="card">
-                <div class="card-title">2. Top 15 Longs vs. Bottom 15 Shorts (Extreme Tail Quantiles)</div>
-                <canvas id="tailBarChart" height="230"></canvas>
-            </div>
-        </div>
-
-        <div class="card">
-            <div class="card-title">
-                <span>3. Cross-Sectional Alpha Factor Ranking Table</span>
-                <span style="font-size: 12px; color: #94a3b8; font-weight: normal;">Click any row to stream asset trajectory</span>
-            </div>
-            <div class="portfolio-budget-control">
-                <label for="portfolioBudget">Portfolio value</label>
-                <span>$</span>
-                <input type="number" id="portfolioBudget" min="0" step="100" value="10000" aria-label="Portfolio value in dollars">
-            </div>
-            <input type="text" id="searchInput" class="search-box" placeholder="🔍 Search Ticker (e.g. NVDA, AAPL, MSFT, TSLA)...">
-            <div class="table-container">
-                <table id="stocksTable">
-                    <thead>
-                        <tr>
-                            <th onclick="sortTable(0)">Rank &#x25B4;&#x25BE;</th>
-                            <th onclick="sortTable(1)">Ticker &#x25B4;&#x25BE;</th>
-                            <th onclick="sortTable(2)">Direction (Conf) &#x25B4;&#x25BE;</th>
-                            <th onclick="sortTable(3)">Composite SNR &#x25B4;&#x25BE;</th>
-                            <th onclick="sortTable(4)">Expected 5D Ret &#x25B4;&#x25BE;</th>
-                            <th onclick="sortTable(5)">Uncertainty (σ) &#x25B4;&#x25BE;</th>
-                            <th onclick="sortTable(6)">Target Group &#x25B4;&#x25BE;</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="stocksTableBody">
-                        ${tableRowsHtml}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-
-    <div class="toast-notify" id="toastNotify"></div>
-
-    <script>
-        let scatterChartInstance = null;
-        let tailBarChartInstance = null;
-        let individualStockChartInstance = null;
-        let currentSelectedTicker = "${initialStock.ticker}";
-        let sortDirection = {};
-        let socket = null;
-
-        function showToast(msg) {
-            const el = document.getElementById('toastNotify');
-            el.textContent = msg;
-            el.classList.add('visible');
-            setTimeout(() => el.classList.remove('visible'), 3200);
-        }
-
-        function updateShareRecommendations() {
-            const budget = Math.max(0, Number(document.getElementById('portfolioBudget').value) || 0);
-            document.querySelectorAll('.suggested-shares').forEach((label) => {
-                const weight = Number(label.dataset.weight) || 0;
-                const price = Number(label.dataset.price) || 0;
-                if (weight <= 0 || price <= 0) {
-                    label.textContent = 'No buy';
-                    return;
-                }
-                const shares = Math.floor((budget * weight) / price);
-                label.textContent = shares > 0 ? 'Buy ' + shares + ' shares' : 'Buy <1 share';
-            });
-        }
-
-        document.getElementById('portfolioBudget').addEventListener('input', updateShareRecommendations);
-
-        try {
-            socket = io();
-            socket.on('connect', () => {
-                const b = document.getElementById('serverBadge');
-                b.textContent = 'LIVE SERVER';
-                b.className = 'badge badge-green';
-            });
-            socket.on('disconnect', () => {
-                const b = document.getElementById('serverBadge');
-                b.textContent = 'OFFLINE';
-                b.className = 'badge badge-red';
-            });
-            socket.on('predictionsUpdated', (data) => {
-                showToast('Predictions updated in real-time!');
-                refreshDashboardFromData(data);
-            });
-            socket.on('predictionsError', (err) => {
-                showToast(err?.error || 'Prediction engine unavailable');
-            });
-        } catch (e) {}
-
-        const initialScatter = ${scatterData};
-        scatterChartInstance = new Chart(document.getElementById('scatterChart'), {
-            type: 'scatter',
-            data: {
-                datasets: [{
-                    label: 'S&P 500 Constituent',
-                    data: initialScatter,
-                    backgroundColor: initialScatter.map(d => d.snr >= 0 ? 'rgba(56, 189, 248, 0.75)' : 'rgba(244, 63, 94, 0.75)'),
-                    pointRadius: 4.5,
-                    pointHoverRadius: 7
-                }]
-            },
-            options: {
-                responsive: true,
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        callbacks: {
-                            label: (ctx) => {
-                                const p = ctx.raw;
-                                return p.ticker + ': ExpRet=' + p.y + '%, σ=' + p.x + '%, SNR=' + p.snr;
-                            }
-                        }
-                    }
-                },
-                scales: {
-                    x: { title: { display: true, text: 'Uncertainty / Volatility Band (σ %)', color: '#94a3b8' }, grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
-                    y: { title: { display: true, text: 'Expected 5-Day Open-to-Open Return (%)', color: '#94a3b8' }, grid: { color: '#334155' }, ticks: { color: '#94a3b8' } }
-                }
-            }
-        });
-
-        tailBarChartInstance = new Chart(document.getElementById('tailBarChart'), {
-            type: 'bar',
-            data: {
-                labels: ${tailLabels},
-                datasets: [{
-                    data: ${tailSnr},
-                    backgroundColor: ${tailColors},
-                    borderRadius: 4
-                }]
-            },
-            options: {
-                responsive: true,
-                plugins: { legend: { display: false } },
-                scales: {
-                    y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' }, title: { display: true, text: 'Composite Alpha Conviction', color: '#94a3b8' } },
-                    x: { grid: { display: false }, ticks: { color: '#f8fafc', font: { size: 10 } } }
-                }
-            }
-        });
-
-        // Delegated Click Handling: Completely immune to single/double quote escaping bugs
-        document.getElementById('stocksTableBody').addEventListener('click', (e) => {
-            const tr = e.target.closest('tr');
-            if (!tr) return;
-            const ticker = tr.getAttribute('data-ticker');
-            if (ticker) selectStock(ticker);
-        });
-
-        document.getElementById('quickSelectChips').addEventListener('click', (e) => {
-            const chip = e.target.closest('.chip');
-            if (!chip) return;
-            const ticker = chip.getAttribute('data-ticker');
-            if (ticker) selectStock(ticker);
-        });
-
-        async function selectStock(ticker) {
-            currentSelectedTicker = ticker;
-            document.querySelectorAll('.chip').forEach(c => {
-                c.classList.toggle('active', c.getAttribute('data-ticker') === ticker.toUpperCase());
-            });
-
-            try {
-                const res = await fetch('/api/stock-forecast/' + encodeURIComponent(ticker));
-                if (res.status === 202) {
-                    showToast('Data cache warming up — retrying...');
-                    setTimeout(() => selectStock(ticker), 2500);
-                    return;
-                }
-                if (!res.ok) return;
-                const data = await res.json();
-                renderIndividualChart(data);
-            } catch (err) {
-                console.error(err);
-            }
-        }
-
-        function renderIndividualChart(data) {
-            document.getElementById('detailTicker').textContent = data.ticker;
-            document.getElementById('detailRank').textContent = '#' + data.rank;
-            document.getElementById('detailSnr').textContent = (data.snr >= 0 ? '+' : '') + Number(data.snr).toFixed(4);
-            document.getElementById('detailReturn').textContent = (data.expectedReturn5d >= 0 ? '+' : '') + Number(data.expectedReturn5d).toFixed(2) + '%';
-            document.getElementById('detailReturn').style.color = data.expectedReturn5d >= 0 ? '#4ade80' : '#f87171';
-            document.getElementById('detailUncertainty').textContent = '±' + Number(data.uncertainty5d).toFixed(2) + '%';
-
-            const dirEl = document.getElementById('detailDirection');
-            const isBullish = data.direction === 'Bullish' || data.snr >= 0;
-            dirEl.textContent = (isBullish ? '▲ ' : '▼ ') + data.direction + ' (' + Number(data.directionConfidence || 50).toFixed(1) + '%)';
-            dirEl.style.color = isBullish ? '#4ade80' : '#f87171';
-
-            const tagEl = document.getElementById('selectedStockTag');
-            tagEl.textContent = (data.group || 'Neutral').toUpperCase();
-            if (data.group === 'Top Long') tagEl.className = 'badge badge-green';
-            else if (data.group === 'Top Short') tagEl.className = 'badge badge-red';
-            else tagEl.className = 'badge badge-neutral';
-
-            const primaryColor = isBullish ? '#38bdf8' : '#f43f5e';
-            const projColor = isBullish ? '#4ade80' : '#f87171';
-            const bandFill = isBullish ? 'rgba(56, 189, 248, 0.15)' : 'rgba(244, 63, 94, 0.15)';
-
-            if (individualStockChartInstance) {
-                individualStockChartInstance.destroy();
-            }
-
-            individualStockChartInstance = new Chart(document.getElementById('individualStockChart'), {
-                type: 'line',
-                data: {
-                    labels: data.labels,
-                    datasets: [
-                        { label: 'Upper Band (+σ)', data: data.upperBand, borderColor: 'transparent', backgroundColor: bandFill, fill: '+1', pointRadius: 0 },
-                        { label: 'Lower Band (-σ)', data: data.lowerBand, borderColor: 'transparent', backgroundColor: 'transparent', fill: false, pointRadius: 0 },
-                        { label: 'Historical Price', data: data.historical, borderColor: primaryColor, backgroundColor: primaryColor, borderWidth: 2, tension: 0.15, pointRadius: 0, pointHoverRadius: 4 },
-                        { label: 'Predicted 5D Trajectory', data: data.projection, borderColor: projColor, backgroundColor: projColor, borderWidth: 3, borderDash: [6, 4], tension: 0.2, pointRadius: 4 }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    interaction: { mode: 'index', intersect: false },
-                    plugins: { legend: { labels: { filter: (item) => !item.text.includes('Band'), color: '#e2e8f0' } } },
-                    scales: {
-                        y: { title: { display: true, text: 'Price (USD)', color: '#94a3b8' }, grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
-                        x: { grid: { color: '#1e293b' }, ticks: { color: '#f8fafc', font: { size: 11 } } }
-                    }
-                }
-            });
-        }
-
-        async function updateModel() {
-            const btn = document.getElementById('btnUpdateModel');
-            const icon = document.getElementById('updateIcon');
-            const label = document.getElementById('updateLabel');
-
-            btn.disabled = true;
-            icon.textContent = '⏳';
-            label.textContent = 'Running Inference...';
-
-            try {
-                const res = await fetch('/api/run-inference', { method: 'POST' });
-                const data = await res.json();
-                if (data && data.predictions) {
-                    refreshDashboardFromData(data);
-                    showToast('Inference complete (' + data.latency + 'ms)!');
-                } else {
-                    showToast(data.message || 'Inference started in background');
-                }
-            } catch (err) {
-                console.error(err);
-                showToast('Inference request failed');
-            } finally {
-                btn.disabled = false;
-                icon.textContent = '⚡';
-                label.textContent = 'Re-Run Model Inference';
-            }
-        }
-
-        function refreshDashboardFromData(data) {
-            if (!data || !data.predictions) return;
-            const predictions = data.predictions;
-
-            document.getElementById('statSpread').textContent = Number(data.marketSpread || 0).toFixed(4);
-            document.getElementById('statUniverse').textContent = predictions.length + ' Stocks';
-            document.getElementById('headerUniverseCount').textContent = predictions.length;
-
-            const topK = data.topK || Math.max(1, Math.ceil(predictions.length * 0.10));
-            document.getElementById('statTargetLong').textContent = topK + ' Stocks';
-            document.getElementById('statTargetShort').textContent = topK + ' Stocks';
-
-            // Update Tail Bar Chart
-            const topTails = [...predictions.slice(0, 25), ...predictions.slice(-25)];
-            tailBarChartInstance.data.labels = topTails.map(p => p.ticker);
-            tailBarChartInstance.data.datasets[0].data = topTails.map(p => Number((p.snr || 0).toFixed(4)));
-            tailBarChartInstance.data.datasets[0].backgroundColor = topTails.map((p, i) => i < 25 ? 'rgba(34, 197, 94, 0.85)' : 'rgba(239, 68, 68, 0.85)');
-            tailBarChartInstance.update();
-
-            // Update Scatter Chart
-            const newScatter = predictions.map(p => ({
-                x: Number((p.uncertainty5d || 0).toFixed(2)),
-                y: Number((p.expectedReturn5d || 0).toFixed(2)),
-                ticker: p.ticker,
-                snr: Number((p.snr || 0).toFixed(4))
-            }));
-            scatterChartInstance.data.datasets[0].data = newScatter;
-            scatterChartInstance.data.datasets[0].backgroundColor = newScatter.map(d => d.snr >= 0 ? 'rgba(56, 189, 248, 0.75)' : 'rgba(244, 63, 94, 0.75)');
-            scatterChartInstance.update();
-
-            // Render Table Rows with Delegated Dataset Targets
-            const tableBody = document.getElementById('stocksTableBody');
-            tableBody.innerHTML = predictions.map((p, idx) => {
-                const rank = p.rank || (idx + 1);
-                const snr = Number(p.snr || 0);
-                const expRet = Number(p.expectedReturn5d || 0);
-                const unc = Number(p.uncertainty5d || 0);
-                const dir = p.direction || (snr >= 0 ? 'Bullish' : 'Bearish');
-                const dirConf = Number(p.directionConfidence || 50.0);
-                const group = p.group || (idx < topK && expRet > 0 ? 'Top Long' : (idx >= predictions.length - topK && expRet < 0 ? 'Top Short' : 'Neutral'));
-
-                let badgeClass = 'badge-neutral';
-                if (group === 'Top Long') badgeClass = 'badge-green';
-                else if (group === 'Top Short') badgeClass = 'badge-red';
-
-                let dirIcon = '●';
-                let dirColor = '#94a3b8';
-                if (dir === 'Bullish') { dirIcon = '▲'; dirColor = '#4ade80'; }
-                else if (dir === 'Bearish') { dirIcon = '▼'; dirColor = '#f87171'; }
-
-                const portfolioWeight = Number(p.portfolioWeight) || 0;
-                const price = Number(p.price) || 0;
-                const budget = Math.max(0, Number(document.getElementById('portfolioBudget').value) || 0);
-                const suggestedShares = portfolioWeight > 0 && price > 0
-                    ? Math.floor((budget * portfolioWeight) / price)
-                    : null;
-                const shareLabel = suggestedShares === null
-                    ? 'No buy'
-                    : (suggestedShares > 0 ? 'Buy ' + suggestedShares + ' shares' : 'Buy <1 share');
-
-                return '<tr data-ticker="' + p.ticker + '">' +
-                    '<td><strong>#' + rank + '</strong></td>' +
-                    '<td><strong style="color: #38bdf8;">' + p.ticker + '</strong><span class="ticker-recommendation suggested-shares" data-weight="' + portfolioWeight + '" data-price="' + price + '">' + shareLabel + '</span></td>' +
-                    '<td style="color:' + dirColor + '; font-weight: 600;">' + dirIcon + ' ' + dir + ' <span style="font-size: 11px; color: #94a3b8;">(' + dirConf.toFixed(1) + '%)</span></td>' +
-                    '<td style="color:' + (snr >= 0 ? '#4ade80' : '#f87171') + '; font-weight: bold;">' + (snr >= 0 ? '+' : '') + snr.toFixed(4) + '</td>' +
-                    '<td style="color:' + (expRet >= 0 ? '#4ade80' : '#f87171') + '; font-weight: bold;">' + (expRet >= 0 ? '+' : '') + expRet.toFixed(2) + '%</td>' +
-                    '<td style="color: #cbd5e1;">&plusmn;' + unc.toFixed(2) + '%</td>' +
-                    '<td><span class="badge ' + badgeClass + '">' + group + '</span></td>' +
-                    '<td><button class="btn-micro btn-forecast-trigger" data-ticker="' + p.ticker + '">Forecast</button></td>' +
-                '</tr>';
-            }).join('');
-
-            applySearchFilter();
-            selectStock(currentSelectedTicker);
-        }
-
-        function applySearchFilter() {
-            const filter = document.getElementById('searchInput').value.trim().toUpperCase();
-            const rows = document.querySelectorAll('#stocksTable tbody tr');
-            rows.forEach(row => {
-                const ticker = row.getAttribute('data-ticker') || '';
-                row.style.display = ticker.toUpperCase().includes(filter) ? '' : 'none';
-            });
-        }
-
-        document.getElementById('searchInput').addEventListener('input', applySearchFilter);
-
-        function searchCustomStock() {
-            const input = document.getElementById('customTickerInput');
-            const val = input.value.trim().toUpperCase();
-            if (val) {
-                selectStock(val);
-                input.value = '';
-            }
-        }
-
-        document.getElementById('customTickerInput').addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') searchCustomStock();
-        });
-
-        function sortTable(colIndex) {
-            const table = document.getElementById('stocksTable');
-            const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.querySelectorAll('tr'));
-            
-            sortDirection[colIndex] = !sortDirection[colIndex];
-            const asc = sortDirection[colIndex];
-
-            rows.sort((a, b) => {
-                let cellA = a.cells[colIndex].textContent.trim().replace(/[#+%\&plusmn;]/g, '');
-                let cellB = b.cells[colIndex].textContent.trim().replace(/[#+%\&plusmn;]/g, '');
-
-                const numA = parseFloat(cellA);
-                const numB = parseFloat(cellB);
-
-                if (!isNaN(numA) && !isNaN(numB)) {
-                    return asc ? numA - numB : numB - numA;
-                }
-                return asc ? cellA.localeCompare(cellB) : cellB.localeCompare(cellA);
-            });
-
-            rows.forEach(r => tbody.appendChild(r));
-        }
-
-        // Initialize display with active stock
-        selectStock(currentSelectedTicker);
-    </script>
-</body>
-</html>`;
+} catch (error) {
+    if (error.code !== 'ENOENT') throw error;
 }
 
-module.exports = { buildPredictionHtmlReport };
+if (!sessionSecret || sessionSecret.length < 32 ||
+    !adminCredentials || typeof adminCredentials !== 'object' ||
+    Array.isArray(adminCredentials) || Object.keys(adminCredentials).length === 0 ||
+    Object.values(adminCredentials).some(password => typeof password !== 'string' || !password)) {
+    throw new Error('Set ADMIN_CREDENTIALS and a 32+ character ADMIN_SESSION_SECRET in .env');
+}
+
+function safeStringEqual(left, right) {
+    const leftBuffer = Buffer.from(String(left));
+    const rightBuffer = Buffer.from(String(right));
+    return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function getSocketAddress(socket) {
+    const address = socket.handshake.address;
+    return normalizeAddress(address);
+}
+
+function normalizeAddress(address) {
+    return address?.startsWith('::ffff:') ? address.slice(7) : address;
+}
+
+function getSocketSite(socket) {
+    try {
+        return new URL(socket.handshake.headers.referer).pathname || '/';
+    } catch {
+        return '/';
+    }
+}
+
+function getSiteBanKey(address, site) {
+    return JSON.stringify([address, site]);
+}
+
+function getBanExpiry(address) {
+    const expiresAt = activeBans.get(address);
+    if (!expiresAt) return null;
+    if (expiresAt <= Date.now()) {
+        activeBans.delete(address);
+        return null;
+    }
+    return expiresAt;
+}
+
+function getBannedSites(address) {
+    if (getBanExpiry(address)) return adminSites.map(site => site.path);
+    return adminSites
+        .map(site => site.path)
+        .filter(site => getBanExpiry(getSiteBanKey(address, site)));
+}
+
+function getSiteBanExpiries(address) {
+    const globalExpiry = getBanExpiry(address);
+    return Object.fromEntries(adminSites.flatMap(site => {
+        const expiresAt = globalExpiry || getBanExpiry(getSiteBanKey(address, site.path));
+        return expiresAt ? [[site.path, expiresAt]] : [];
+    }));
+}
+
+function getRequestedSite(req) {
+    if (adminSitePaths.has(req.path)) return req.path;
+    try {
+        const refererPath = new URL(req.get('referer')).pathname;
+        return adminSitePaths.has(refererPath) ? refererPath : null;
+    } catch {
+        return null;
+    }
+}
+
+app.use((req, res, next) => {
+    if (req.path.startsWith('/admin') || req.path.startsWith('/socket.io')) return next();
+    const site = getRequestedSite(req);
+    if (!site) return next();
+
+    const address = normalizeAddress(req.socket.remoteAddress);
+    const expiresAt = getBanExpiry(address) || getBanExpiry(getSiteBanKey(address, site));
+    if (!expiresAt) return next();
+    const remainingSeconds = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+
+    return res.status(403).set('Cache-Control', 'no-store').type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access denied</title>
+<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#171311;color:#f5eee9;font:16px/1.5 system-ui,sans-serif}main{width:min(100%,460px);padding:36px;border-left:4px solid #ee765c;background:#241c19}h1{margin:0 0 10px;font-size:30px}p{margin:0;color:#c5b7b0}</style></head>
+<body><main><h1>Access denied</h1><p>This page is unavailable until the ban expires.</p><p>Time remaining: <strong id="ban-countdown">${remainingSeconds} seconds</strong></p></main>
+<script>
+const banExpiresAt = ${expiresAt};
+const countdown = document.getElementById('ban-countdown');
+function updateBanCountdown() {
+    const seconds = Math.max(0, Math.ceil((banExpiresAt - Date.now()) / 1000));
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+    const display = days > 0
+        ? days + 'd ' + (hours % 24) + 'h ' + (minutes % 60) + 'm ' + (seconds % 60) + 's'
+        : hours > 0
+            ? hours + 'h ' + (minutes % 60) + 'm ' + (seconds % 60) + 's'
+            : minutes > 0
+                ? minutes + 'm ' + (seconds % 60) + 's'
+                : seconds + ' seconds';
+    countdown.textContent = display;
+    if (seconds === 0) window.location.reload();
+    else window.setTimeout(updateBanCountdown, 1000);
+}
+updateBanCountdown();
+</script></body></html>`);
+});
+
+app.get('/stock_predictor.html', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+        const result = getLatestPredictions();
+        if (!result) {
+            triggerBackgroundInference();
+            return res.status(200).send(
+                '<html><body style="background:#0b0f19;color:#f1f5f9;font-family:sans-serif;padding:40px;text-align:center;">' +
+                '<h2>Warming up predictions…</h2><p>This page will refresh automatically in a few seconds.</p>' +
+                '<script>setTimeout(() => location.reload(), 4000);</script>' +
+                '</body></html>'
+            );
+        }
+        const html = buildPredictionHtmlReport(result);
+        res.set('Content-Type', 'text/html');
+        res.send(html);
+    } catch (err) {
+        console.error('Failed to render stock predictor page:', err);
+        res.status(500).send('Failed to generate predictor page');
+    }
+});
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+function persistBans() {
+    const currentBans = Object.fromEntries(
+        [...activeBans].filter(([, expiresAt]) => expiresAt > Date.now())
+    );
+    const temporaryPath = `${adminBanStorePath}.tmp`;
+    fs.writeFileSync(temporaryPath, JSON.stringify(currentBans, null, 2));
+    fs.renameSync(temporaryPath, adminBanStorePath);
+}
+
+function createAdminSession(username) {
+    const payload = Buffer.from(JSON.stringify({
+        username,
+        expiresAt: Date.now() + adminSessionDuration
+    })).toString('base64url');
+    const signature = crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
+    return `${payload}.${signature}`;
+}
+
+function getAdminSession(req) {
+    const cookieHeader = req.headers.cookie || '';
+    const cookie = cookieHeader.split(';').map(value => value.trim())
+        .find(value => value.startsWith(`${adminCookieName}=`));
+    if (!cookie) return null;
+
+    const token = cookie.slice(adminCookieName.length + 1);
+    const [payload, suppliedSignature] = token.split('.');
+    if (!payload || !suppliedSignature) return null;
+
+    const expectedSignature = crypto.createHmac('sha256', sessionSecret)
+        .update(payload)
+        .digest();
+    let actualSignature;
+    try {
+        actualSignature = Buffer.from(suppliedSignature, 'base64url');
+    } catch {
+        return null;
+    }
+    if (actualSignature.length !== expectedSignature.length ||
+        !crypto.timingSafeEqual(actualSignature, expectedSignature)) return null;
+
+    try {
+        const session = JSON.parse(Buffer.from(payload, 'base64url').toString());
+        if (session.expiresAt <= Date.now() || !Object.hasOwn(adminCredentials, session.username)) return null;
+        return session;
+    } catch {
+        return null;
+    }
+}
+
+function renderAdminLogin(res) {
+    res.set('Cache-Control', 'no-store').type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin sign in</title><style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#101616;color:#eef2ed;font:16px/1.5 system-ui,sans-serif}
+main{width:min(100%,380px);padding:32px;border:1px solid #35413b;background:#19211d}h1{margin:0 0 8px;font-size:26px}p{margin:0 0 24px;color:#aebbb2}label{display:block;margin:16px 0 6px;font-size:14px}input{width:100%;padding:12px;border:1px solid #46534b;background:#111814;color:#fff;font:inherit}button{width:100%;margin-top:22px;padding:12px;border:0;background:#b9e36a;color:#14200d;font:700 15px system-ui,sans-serif;cursor:pointer}button:hover{background:#c9f47a}
+</style></head><body><main><h1>Admin sign in</h1><p>Restricted access</p><form method="post" action="/admin/login">
+<label for="username">Username</label><input id="username" name="username" autocomplete="username" required>
+<label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">Sign in</button></form></main></body></html>`);
+}
+
+function renderAccessDenied(res) {
+    res.status(403).set('Cache-Control', 'no-store').type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Access denied</title><style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#171311;color:#f5eee9;font:16px/1.5 system-ui,sans-serif}main{width:min(100%,480px);padding:36px;border-left:4px solid #ee765c;background:#241c19}h1{margin:0 0 10px;font-size:30px}p{margin:0 0 24px;color:#c5b7b0}a{color:#f4a28e}
+</style></head><body><main><h1>Access denied</h1><p>This account is not authorized to access the admin panel.</p><a href="/admin">Return to sign in</a></main></body></html>`);
+}
+
+app.get('/admin', (req, res) => {
+    if (!getAdminSession(req)) return renderAdminLogin(res);
+    res.set('Cache-Control', 'no-store').sendFile(path.join(__dirname, 'admin.html'));
+});
+
+app.post('/admin/login', (req, res) => {
+    const { username, password } = req.body || {};
+    const expectedPassword = typeof username === 'string' ? adminCredentials[username] : null;
+    if (typeof expectedPassword !== 'string' || typeof password !== 'string' ||
+        !safeStringEqual(password, expectedPassword)) return renderAccessDenied(res);
+
+    res.cookie(adminCookieName, createAdminSession(username), {
+        httpOnly: true,
+        sameSite: 'strict',
+        secure: process.env.NODE_ENV === 'production',
+        path: '/admin',
+        maxAge: adminSessionDuration
+    });
+    res.redirect(303, '/admin');
+});
+
+app.post('/admin/logout', (req, res) => {
+    res.clearCookie(adminCookieName, { httpOnly: true, sameSite: 'strict', path: '/admin' });
+    res.redirect(303, '/admin');
+});
+
+app.get('/admin/users', (req, res) => {
+    if (!getAdminSession(req)) return res.status(403).json({ error: 'Access denied' });
+    const users = [...io.sockets.sockets.values()].map(socket => ({
+        id: socket.id,
+        name: normalizeName(socket.data.name),
+        site: getSocketSite(socket),
+        bannedSites: getBannedSites(getSocketAddress(socket)),
+        siteBanExpiries: getSiteBanExpiries(getSocketAddress(socket)),
+        connectedAt: socket.data.connectedAt
+    }));
+    res.set('Cache-Control', 'no-store').json({ users, sites: adminSites });
+});
+
+app.post('/admin/users/:id/site-bans', (req, res) => {
+    if (!getAdminSession(req)) return res.status(403).json({ error: 'Access denied' });
+    const socket = io.sockets.sockets.get(req.params.id);
+    if (!socket) return res.status(404).json({ error: 'User is no longer online' });
+
+    const { siteBans } = req.body || {};
+    if (!Array.isArray(siteBans) || siteBans.some(ban =>
+        !ban || !adminSitePaths.has(ban.site) || !Number.isInteger(ban.duration) ||
+        ban.duration < 1 || ban.duration > 30 * 24 * 60 * 60
+    )) {
+        return res.status(400).json({ error: 'Choose valid sites and ban durations' });
+    }
+
+    const address = getSocketAddress(socket);
+    if (!address) return res.status(400).json({ error: 'Could not identify this connection' });
+    const uniqueSiteBans = [...new Map(siteBans.map(ban => [ban.site, ban])).values()];
+    const previousBans = new Map(activeBans);
+
+    activeBans.delete(address);
+    for (const site of adminSites) activeBans.delete(getSiteBanKey(address, site.path));
+
+    const expiresAtBySite = new Map();
+    for (const ban of uniqueSiteBans) {
+        const expiresAt = Date.now() + ban.duration * 1000;
+        activeBans.set(getSiteBanKey(address, ban.site), expiresAt);
+        expiresAtBySite.set(ban.site, expiresAt);
+    }
+
+    try {
+        persistBans();
+    } catch (error) {
+        activeBans.clear();
+        for (const [key, expiry] of previousBans) activeBans.set(key, expiry);
+        console.error('Failed to persist site bans:', error.message || error);
+        return res.status(500).json({ error: 'Could not save site bans' });
+    }
+
+    for (const candidate of io.sockets.sockets.values()) {
+        const duration = uniqueSiteBans.find(ban => ban.site === getSocketSite(candidate))?.duration;
+        if (getSocketAddress(candidate) !== address || !duration) continue;
+        io.to(candidate.id).emit('ban', duration);
+        candidate.disconnect(true);
+    }
+
+    return res.json({ siteBanExpiries: Object.fromEntries(expiresAtBySite) });
+});
+
+app.post('/admin/users/:id/ban', (req, res) => {
+    if (!getAdminSession(req)) return res.status(403).json({ error: 'Access denied' });
+    const socket = io.sockets.sockets.get(req.params.id);
+    if (!socket) return res.status(404).json({ error: 'User is no longer online' });
+
+    const requestedDuration = req.body?.duration;
+    const duration = Number.isInteger(requestedDuration) && requestedDuration > 0
+        ? Math.min(requestedDuration, 30 * 24 * 60 * 60)
+        : 30;
+    const address = getSocketAddress(socket);
+    const site = getSocketSite(socket);
+    const scope = req.body?.scope === 'all' ? 'all' : 'page';
+    if (!address) return res.status(400).json({ error: 'Could not identify this connection' });
+
+    const expiresAt = Date.now() + duration * 1000;
+    activeBans.set(scope === 'all' ? address : getSiteBanKey(address, site), expiresAt);
+    try {
+        persistBans();
+    } catch (error) {
+        activeBans.delete(scope === 'all' ? address : getSiteBanKey(address, site));
+        console.error('Failed to persist admin ban:', error.message || error);
+        return res.status(500).json({ error: 'Could not save the ban' });
+    }
+
+    const name = normalizeName(socket.data.name);
+    const affectedSockets = [...io.sockets.sockets.values()].filter(candidate =>
+        getSocketAddress(candidate) === address &&
+        (scope === 'all' || getSocketSite(candidate) === site)
+    );
+    for (const affectedSocket of affectedSockets) {
+        io.to(affectedSocket.id).emit('ban', duration);
+        affectedSocket.disconnect(true);
+    }
+    return res.json({ message: `${name} was banned for ${duration} seconds`, expiresAt, scope, site });
+});
+
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: { origin: '*', methods: ['GET', 'POST'] }
+});
+
+io.use((socket, next) => {
+    const address = getSocketAddress(socket);
+    const site = getSocketSite(socket);
+    const expiresAt = getBanExpiry(address) || getBanExpiry(getSiteBanKey(address, site));
+    if (!expiresAt) return next();
+
+    const error = new Error('This connection is temporarily banned');
+    error.data = {
+        code: 'USER_BANNED',
+        expiresAt,
+        remainingSeconds: Math.ceil((expiresAt - Date.now()) / 1000)
+    };
+    return next(error);
+});
+
+let inferenceInProgress = false;
+let chatHistory = [];
+
+function normalizeName(name) {
+    const clean = String(name || '').trim();
+    if (!clean) return 'Guest';
+    return clean.slice(0, 24);
+}
+
+function normalizeMessagePayload(payload) {
+    if (typeof payload === 'string') {
+        return { name: 'Guest', text: payload, timestamp: Date.now() };
+    }
+
+    return {
+        name: normalizeName(payload?.name),
+        text: String(payload?.text || payload?.message || '').trim(),
+        timestamp: Number(payload?.timestamp) || Date.now()
+    };
+}
+
+function triggerBackgroundInference() {
+    if (inferenceInProgress) return;
+    inferenceInProgress = true;
+
+    runInference({})
+        .then(result => {
+            io.emit('predictionsUpdated', result);
+        })
+        .catch(err => {
+            console.error('Background inference failed:', err.message || err);
+            io.emit('predictionsError', { error: err.message || 'Inference failed' });
+        })
+        .finally(() => {
+            inferenceInProgress = false;
+        });
+}
+
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// Kick off inference in the background; never block the response on it.
+app.post('/api/run-inference', async (req, res) => {
+    triggerBackgroundInference();
+    const existing = getLatestPredictions();
+    if (existing) {
+        // Respond immediately with what we have; the fresh result will arrive via socket 'predictionsUpdated'
+        return res.json({ message: 'Inference started; live update will follow', ...existing });
+    }
+    return res.status(202).json({ message: 'Inference started, no cached predictions yet' });
+});
+
+app.get('/api/stock-forecast/:ticker', async (req, res) => {
+  try {
+    const ticker = String(req.params.ticker || '')
+      .trim()
+      .toUpperCase();
+    const result = getLatestPredictions();
+    if (!result) {
+      triggerBackgroundInference();
+      return res
+        .status(202)
+        .json({ error: 'Predictions still initializing, try again shortly' });
+    }
+    const forecast = await getStockForecast(ticker, result);
+    if (!forecast) {
+      return res
+        .status(404)
+        .json({ error: `No stock forecast available for ${ticker}` });
+    }
+    return res.json(forecast);
+  } catch (err) {
+    console.error('Stock forecast request failed:', err.message || err);
+    return res
+      .status(500)
+      .json({ error: 'Unable to load stock forecast data' });
+  }
+});
+
+io.on('connection', (socket) => {
+    socket.data.connectedAt = new Date().toISOString();
+    console.log(`Client connected: ${socket.id}`);
+
+    socket.emit('welcome', { message: 'Connected to Socket.IO server', id: socket.id });
+    socket.emit('chatHistory', chatHistory);
+
+    socket.on('setName', (name) => {
+        const cleanName = normalizeName(name);
+        socket.data.name = cleanName;
+        socket.emit('nameSet', { name: cleanName });
+        io.emit('systemMessage', {
+            type: 'system',
+            message: `${cleanName} joined the chat`,
+            timestamp: Date.now()
+        });
+    });
+
+    socket.on('requestPredictions', () => {
+        const result = getLatestPredictions();
+        if (result) {
+            socket.emit('predictionsUpdated', result);
+        } else {
+            triggerBackgroundInference();
+            socket.emit('predictionsError', { error: 'Predictions still initializing' });
+        }
+    });
+
+    socket.on('message', (payload) => {
+        const message = normalizeMessagePayload(payload);
+        if (!message.text) return;
+
+        const finalMessage = {
+            name: message.name || socket.data.name || 'Guest',
+            text: message.text,
+            timestamp: message.timestamp || Date.now(),
+            senderId: socket.id
+        };
+
+        chatHistory = [...chatHistory, finalMessage].slice(-100);
+        io.emit('message', finalMessage);
+    });
+
+    socket.on('banUser', (user) => {
+        io.emit('userBanned', user);
+    })
+
+    socket.on('disconnect', (reason) => {
+        console.log(`Client disconnected: ${socket.id} (${reason})`);
+    });
+});
+
+const PORT = process.env.PORT || 10000;
+const HOST = '0.0.0.0';
+
+server.listen(PORT, HOST, () => {
+    console.log(`Socket.IO server running on port ${PORT}`);
+    // Warm up predictions in the background worker — fire-and-forget, never blocks startup
+    triggerBackgroundInference();
+});
