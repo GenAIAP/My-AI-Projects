@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="color-scheme" content="light">
+	<title>Admin | Online users</title>
+	<link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+	<header class="topbar">
+		<a class="wordmark" href="/admin" aria-label="Admin home"><span class="wordmark-mark">A</span>ADMIN</a>
+		<form action="/admin/logout" method="post">
+			<button class="signout" type="submit">Sign out</button>
+		</form>
+	</header>
+
+	<main class="content">
+		<div class="page-heading">
+			<p class="eyebrow">CONTROL PANEL <span>/</span> PRESENCE</p>
+			<h1>Online users</h1>
+			<p class="description">Live connections to your site.</p>
+		</div>
+
+		<section class="user-section" aria-labelledby="users-title">
+			<div class="section-heading">
+				<div>
+					<h2 id="users-title">Currently connected</h2>
+					<p id="updated-at" class="updated-at">Checking connections...</p>
+				</div>
+				<div class="online-count"><span class="live-dot" aria-hidden="true"></span><strong id="user-count">0</strong><span>online</span></div>
+			</div>
+			<div id="user-list" class="user-list" aria-live="polite"></div>
+			<p id="empty-state" class="empty-state" hidden>No users are online right now.</p>
+			<p id="error-state" class="error-state" role="alert" hidden>Could not refresh the user list. Retrying...</p>
+		</section>
+	</main>
+
+	<script>
+		const userList = document.getElementById('user-list');
+		const userCount = document.getElementById('user-count');
+		const updatedAt = document.getElementById('updated-at');
+		const emptyState = document.getElementById('empty-state');
+		const errorState = document.getElementById('error-state');
+		const expandedUsers = new Set();
+		const siteBanDrafts = new Map();
+
+		function formatConnectedAt(value) {
+			const date = new Date(value);
+			if (Number.isNaN(date.getTime())) return 'Recently';
+			return `Since ${new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date)}`;
+		}
+
+		function renderUsers(users, sites) {
+			userList.replaceChildren();
+			for (const user of users) {
+				const entry = document.createElement('section');
+				entry.className = 'user-entry';
+				const row = document.createElement('article');
+				row.className = 'user-row';
+
+				const avatar = document.createElement('span');
+				avatar.className = 'avatar';
+				avatar.setAttribute('aria-hidden', 'true');
+				avatar.textContent = user.name.trim().charAt(0).toUpperCase() || '?';
+
+				const details = document.createElement('div');
+				details.className = 'user-details';
+				const name = document.createElement('strong');
+				name.className = 'user-name';
+				name.textContent = user.name;
+				const connectedAt = document.createElement('span');
+				connectedAt.className = 'connected-at';
+				connectedAt.textContent = `${formatConnectedAt(user.connectedAt)} · ${user.site === '/' ? 'Home page' : user.site}`;
+				details.append(name, connectedAt);
+
+				const accessDetails = document.createElement('details');
+				accessDetails.className = 'site-access';
+				accessDetails.open = expandedUsers.has(user.id);
+				accessDetails.addEventListener('toggle', () => {
+					if (accessDetails.open) expandedUsers.add(user.id);
+					else expandedUsers.delete(user.id);
+				});
+				const summary = document.createElement('summary');
+				summary.textContent = 'Manage site access';
+				const fieldset = document.createElement('fieldset');
+				const legend = document.createElement('legend');
+				legend.textContent = 'Checked sites are banned';
+				fieldset.append(legend);
+				const userDraft = siteBanDrafts.get(user.id);
+
+				for (const site of sites) {
+					const siteRow = document.createElement('div');
+					siteRow.className = 'site-option';
+					const label = document.createElement('label');
+					label.className = 'site-name';
+					const checkbox = document.createElement('input');
+					checkbox.type = 'checkbox';
+					checkbox.value = site.path;
+					const savedDuration = userDraft?.get(site.path)?.duration ?? 30;
+					checkbox.checked = userDraft?.has(site.path)
+						? userDraft.get(site.path).banned
+						: user.bannedSites.includes(site.path);
+					const siteName = document.createElement('span');
+					siteName.textContent = site.label;
+					label.append(checkbox, siteName);
+
+					const durationLabel = document.createElement('label');
+					durationLabel.className = 'duration-setting';
+					const durationInput = document.createElement('input');
+					durationInput.type = 'number';
+					durationInput.min = '1';
+					durationInput.max = String(30 * 24 * 60 * 60);
+					durationInput.step = '1';
+					durationInput.value = String(savedDuration);
+					durationInput.required = true;
+					durationInput.setAttribute('aria-label', `${site.label} ban duration in seconds`);
+					const secondsLabel = document.createElement('span');
+					secondsLabel.textContent = 'sec';
+					durationLabel.append(durationInput, secondsLabel);
+
+					const updateDraft = () => {
+						const draft = new Map();
+						for (const row of fieldset.querySelectorAll('.site-option')) {
+							const siteCheckbox = row.querySelector('.site-name input');
+							const siteDuration = row.querySelector('.duration-setting input');
+							draft.set(siteCheckbox.value, {
+								banned: siteCheckbox.checked,
+								duration: Number(siteDuration.value) || 30
+							});
+						}
+						siteBanDrafts.set(user.id, draft);
+					};
+					checkbox.addEventListener('change', updateDraft);
+					durationInput.addEventListener('input', updateDraft);
+					siteRow.append(label, durationLabel);
+					fieldset.append(siteRow);
+				}
+
+				const saveButton = document.createElement('button');
+				saveButton.className = 'save-site-bans';
+				saveButton.type = 'button';
+				saveButton.textContent = 'Save access';
+				const saveStatus = document.createElement('span');
+				saveStatus.className = 'save-status';
+				saveButton.addEventListener('click', async () => {
+					saveButton.disabled = true;
+					saveStatus.textContent = 'Saving...';
+					try {
+						const siteBans = [];
+						for (const siteRow of fieldset.querySelectorAll('.site-option')) {
+							const checkbox = siteRow.querySelector('.site-name input');
+							const durationInput = siteRow.querySelector('.duration-setting input');
+							if (!checkbox.checked) continue;
+							if (!durationInput.reportValidity()) throw new Error('Enter a valid duration');
+							siteBans.push({ site: checkbox.value, duration: Number(durationInput.value) });
+						}
+						const response = await fetch(`/admin/users/${encodeURIComponent(user.id)}/site-bans`, {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({ siteBans })
+						});
+						if (response.status === 403) {
+							window.location.assign('/admin');
+							return;
+						}
+						if (response.status === 404) {
+							await refreshUsers();
+							return;
+						}
+						if (!response.ok) throw new Error('Could not save site access');
+						siteBanDrafts.delete(user.id);
+						await refreshUsers();
+					} catch {
+						saveStatus.textContent = 'Could not save. Try again.';
+						saveButton.disabled = false;
+					}
+				});
+				accessDetails.append(summary, fieldset, saveButton, saveStatus);
+
+				const presence = document.createElement('span');
+				presence.className = 'presence';
+				presence.innerHTML = '<span class="live-dot" aria-hidden="true"></span>Online';
+				row.append(avatar, details, presence);
+				entry.append(row, accessDetails);
+				userList.append(entry);
+			}
+
+			userCount.textContent = String(users.length);
+			emptyState.hidden = users.length !== 0;
+			updatedAt.textContent = `Updated ${new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' }).format(new Date())}`;
+		}
+
+		async function refreshUsers() {
+			try {
+				const response = await fetch('/admin/users', { cache: 'no-store' });
+				if (response.status === 403) {
+					window.location.assign('/admin');
+					return;
+				}
+				if (!response.ok) throw new Error('Unable to load users');
+				const { users, sites } = await response.json();
+				renderUsers(users, sites);
+				errorState.hidden = true;
+			} catch {
+				errorState.hidden = false;
+				updatedAt.textContent = 'Live list temporarily unavailable';
+			}
+		}
+
+		refreshUsers();
+		window.setInterval(refreshUsers, 3000);
+	</script>
+</body>
+</html>
