@@ -114,6 +114,7 @@
   <script src="/socket.io/socket.io.js"></script>
   <script>
     let socket = null;
+    let banRetryTimer = null;
     const statusPill = document.getElementById('statusPill');
     const statusText = document.getElementById('statusText');
     const toastContainer = document.getElementById('toastContainer');
@@ -132,10 +133,19 @@
       }, 3000);
     }
 
+    function retryAfterBan(duration) {
+      if (banRetryTimer) clearTimeout(banRetryTimer);
+      socket.disconnect();
+      banRetryTimer = setTimeout(() => socket.connect(), duration * 1000 + 250);
+    }
+
     try {
       if (typeof io !== 'undefined') {
         socket = io();
+
         socket.on('connect', () => {
+          if (banRetryTimer) clearTimeout(banRetryTimer);
+          banRetryTimer = null;
           if (statusPill) statusPill.classList.add('online');
           if (statusText) statusText.textContent = 'Live Server';
         });
@@ -149,6 +159,22 @@
           if (data && data.text) {
             showToast(data.text);
           }
+        });
+
+        socket.on('ban', (duration) => {
+          if (duration && duration > 0) {
+            showToast(`You have been banned for ${duration} seconds`);
+            retryAfterBan(duration);
+          }
+        });
+
+        socket.on('connect_error', (error) => {
+          if (error.data?.code !== 'USER_BANNED') return;
+          const duration = Math.max(1, error.data.remainingSeconds || 1);
+          if (statusPill) statusPill.classList.remove('online');
+          if (statusText) statusText.textContent = 'Offline';
+          showToast(`You are banned for ${duration} more seconds`);
+          retryAfterBan(duration);
         });
       } else {
         if (statusText) statusText.textContent = 'Standalone';
