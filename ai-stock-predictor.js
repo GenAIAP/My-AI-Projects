@@ -1,13 +1,16 @@
 // File: ai-stock-predictor.js
 // ==============================================================================
-// SPATIO-TEMPORAL NEURAL FACTOR ALPHA PREDICTOR (PRODUCTION V11 ARCHITECTURE)
-// Fully Synchronized with V11 High-Speed Python Model Engine:
-//   - 11 Stationary Factors (Overnight Gap vs. Intraday Momentum Decomposition)
-//   - Verified 503-Stock GICS Sector Embedding Injection (Intra-Sector Prior)
-//   - Native 100% FlashAttention-2 / SDPA ONNX Tensor Binding
-//   - Convex Power-Law Allocation Engine (K=15, p=2.5) + Dynamic Macro Cash Switch
-//   - Two-Sided Non-Parametric Rank Calibration (Balanced Longs & Shorts)
-//   - Point-in-Time S&P 500 Universe & Distress Delisting Quarantine
+// 3D HIERARCHICAL MS-iTRANSFORMER ONNX INFERENCE ENGINE
+// Fully Synchronized with sp500_hierarchical_quant_master.py & V6.onnx
+// ==============================================================================
+// Inputs       : x_features [1, N, SEQ_LEN, 15]
+//                stock_mask [1, N]
+//                sector_ids [1, N]
+//                macro_regime [1, 4]
+// Features     : 15 Cross-Sectional Factors (Scaled to [-1, 1] per session)
+// Hierarchy    : 11 GICS Sector Bottleneck Attention Centroids (IDs: 0-10)
+// Calibration  : Non-Parametric Rank-Quantile Volatility Sizing (Max ~3.5% 5D Return)
+// Execution    : Staggered Monday Conviction Hurdle + Inverse-Vol Risk Parity
 // ==============================================================================
 
 const fs = require('fs');
@@ -16,49 +19,65 @@ const { parentPort, Worker, workerData, isMainThread } = require('worker_threads
 const ort = require('onnxruntime-node');
 
 // ==============================================================================
-// SECTION 1: GLOBAL CONSTANTS & UNIVERSE SPECIFICATION
+// SECTION 1: SYSTEM CONFIGURATION & GICS SECTOR TAXONOMY
 // ==============================================================================
-const BENCHMARK_TICKER = 'SPY';
-const STOCK_RANGE_DAYS = 230;               // ~160 sessions to seed rolling 20d/14d windows
-const CACHE_TTL_MS = 15 * 60 * 1000;        // 15-minute in-memory cache TTL
-const DISK_CACHE_TTL_MS = 12 * 3600 * 1000; // 12-hour persistent disk cache TTL
-const FETCH_BATCH_SIZE = 30;                // Concurrency limit for Yahoo Finance calls
-const BATCH_DELAY_MS = 60;                  // Polite throttle delay between batch calls
+const BENCHMARK_TICKER = '^GSPC';
+const STOCK_RANGE_DAYS = 240;               // ~165 trading days
+const CACHE_TTL_MS = 15 * 60 * 1000;        // 15-minute in-memory cache
+const DISK_CACHE_TTL_MS = 12 * 3600 * 1000; // 12-hour persistent disk cache
+const FETCH_BATCH_SIZE = 30;
+const BATCH_DELAY_MS = 50;
 
-const MAX_STOCKS = 505;
-const LOOKBACK = 100;
-const NUM_FEATURES = 11;                    // 11 Stationary Microstructure Features
-const MACRO_DIM = 4;
-const NUM_FACTORS = 16;                     // 16 Systematic Latent Factors
-const DEFAULT_TOP_K = 15;                   // Proven optimal K=15 concentration
-const POWER_DECAY_P = 2.5;                  // Proven optimal convex power-law exponent
-const MACRO_CASH_TRIGGER = -0.03;           // SPY 20d momentum threshold (-3.0%)
-const DEFENSIVE_EXPOSURE = 0.60;            // 40% Cash preservation during market dips
-const DEFAULT_EXECUTION_FRICTION = 0.0010;  // 10 bps slippage per rebalance
+const DEFAULT_MAX_STOCKS = 505;
+const DEFAULT_SEQ_LEN = 60;
+const NUM_FEATURES = 15;
+const DEFAULT_MACRO_DIM = 4;
+const DEFAULT_TOP_K = 15;
+
+// Risk & Sizing Controls
+const CONVICTION_THRESHOLD = 0.0030;        // 0.30% minimum target alpha
+const MONDAY_HURDLE_MULT = 1.5;             // 1.5x hurdle on Mondays
+const MIN_CAPITAL_EXPOSURE = 0.20;          // 20% floor exposure
+const MAX_CAPITAL_EXPOSURE = 1.00;          // 100% ceiling exposure
+const LOW_CONVICTION_SPREAD = 0.0020;
+const HIGH_CONVICTION_SPREAD = 0.0080;
+const TRANSACTION_FEE_BPS = 0.0010;
 
 const FEATURE_NAMES = [
-    'ret_overnight',
-    'ret_intraday',
-    'ret_5d',
-    'ret_20d',
-    'hl_spread',
-    'gk_vol',
-    'norm_vol',
-    'rsi_14',
-    'vol_price_drift',
-    'amihud_illiq',
-    'spy_lead_lag'
+    'ret_1d', 'ret_5d', 'ret_10d', 'ret_20d',
+    'gk_vol', 'parkinson_vol',
+    'rsi_14', 'macd_norm', 'macd_hist_norm', 'bb_pct_b',
+    'norm_volume', 'hl_spread', 'co_spread', 'dist_sma_20', 'dist_sma_50'
 ];
 
-// Archived and delisted historical listings quarantined to avoid survivorship leakage
+const SECTOR_TO_ID = {
+    'Technology': 0, 'Healthcare': 1, 'Financials': 2, 'Discretionary': 3,
+    'Communication': 4, 'Industrials': 5, 'Staples': 6, 'Energy': 7,
+    'Utilities': 8, 'RealEstate': 9, 'Materials': 10, 'General': 0
+};
+
+const GICS_CLEAN_MAP = {
+    'Information Technology': 'Technology', 'Technology': 'Technology',
+    'Health Care': 'Healthcare', 'Healthcare': 'Healthcare',
+    'Financials': 'Financials',
+    'Consumer Discretionary': 'Discretionary', 'Discretionary': 'Discretionary',
+    'Communication Services': 'Communication', 'Communication': 'Communication',
+    'Industrials': 'Industrials',
+    'Consumer Staples': 'Staples', 'Staples': 'Staples',
+    'Energy': 'Energy',
+    'Utilities': 'Utilities',
+    'Real Estate': 'RealEstate', 'RealEstate': 'RealEstate',
+    'Materials': 'Materials', 'General': 'General'
+};
+
+// Quarantine PARA (recycled ticker for penny stock Banzai) and historical dead tickers
 const DEAD_TICKERS = new Set([
-    'SBNY', 'SIVB', 'FRC', 'DRE', 'TWTR', 'PKI', 'ANTM', 'FB',
+    'PARA', 'SBNY', 'SIVB', 'FRC', 'DRE', 'TWTR', 'PKI', 'ANTM', 'FB',
     'BIO', 'ETSY', 'ATVI', 'FLIR', 'CA', 'HOT', 'CMA', 'ZION',
     'AAL', 'WHR', 'SEE', 'LUMN', 'NWL', 'DXC', 'FBHS', 'IPGP',
     'AIV', 'TSS', 'PEAK', 'RE'
 ]);
 
-// Verified S&P 500 Constituent Universe (503 Primary Active Listings)
 const SP500_TICKERS = [
     'A', 'AAPL', 'ABBV', 'ABNB', 'ABT', 'ACGL', 'ACN', 'ADBE', 'ADI', 'ADM', 'ADP', 'ADSK', 'AEE', 'AEP',
     'AES', 'AFL', 'AIG', 'AIZ', 'AJG', 'AKAM', 'ALB', 'ALGN', 'ALL', 'ALLE', 'AMAT', 'AMCR', 'AMD', 'AME', 'AMGN',
@@ -84,8 +103,8 @@ const SP500_TICKERS = [
     'MO', 'MOH', 'MOS', 'MPC', 'MPWR', 'MRK', 'MRNA', 'MS', 'MSCI', 'MSFT', 'MSI', 'MTB', 'MTCH', 'MTD', 'MU',
     'NCLH', 'NDAQ', 'NDSN', 'NEE', 'NEM', 'NFLX', 'NI', 'NKE', 'NOC', 'NOW', 'NRG', 'NSC', 'NTAP', 'NTRS', 'NUE',
     'NVDA', 'NVR', 'NWS', 'NWSA', 'NXPI', 'O', 'ODFL', 'OKE', 'OMC', 'ON', 'ORCL', 'ORLY', 'OTIS', 'OXY', 'PANW',
-    'PARA', 'PAYC', 'PAYX', 'PCAR', 'PCG', 'PEG', 'PEP', 'PFE', 'PFG', 'PG', 'PGR', 'PH', 'PHM', 'PKG', 'PLD',
-    'PLTR', 'PM', 'PNC', 'PNR', 'PNW', 'PODD', 'POOL', 'PPG', 'PPL', 'PRU', 'PSA', 'PSX', 'PTC', 'PWR', 'PYPL',
+    'PAYC', 'PAYX', 'PCAR', 'PCG', 'PEG', 'PEP', 'PFE', 'PFG', 'PG', 'PGR', 'PH', 'PHM', 'PKG', 'PLD',
+    'PLTR', 'PM', 'PNC', 'PNR', 'PNW', 'PODD', 'POOL', 'PPG', 'PPL', 'PRU', 'PSA', 'PSKY', 'PSX', 'PTC', 'PWR', 'PYPL',
     'QCOM', 'QRVO', 'RCL', 'REG', 'REGN', 'RF', 'RHI', 'RJF', 'RL', 'RMD', 'ROK', 'ROL', 'ROP', 'ROST', 'RSG',
     'RTX', 'RVTY', 'SBAC', 'SBUX', 'SCHW', 'SHW', 'SJM', 'SLB', 'SMCI', 'SNA', 'SNPS', 'SO', 'SOLV', 'SPG',
     'SPGI', 'SRE', 'STE', 'STLD', 'STT', 'STX', 'STZ', 'SWK', 'SWKS', 'SYF', 'SYK', 'SYY', 'T', 'TAP', 'TDG',
@@ -96,580 +115,151 @@ const SP500_TICKERS = [
     'WYNN', 'XEL', 'XOM', 'XYL', 'YUM', 'ZBH', 'ZBRA', 'ZTS'
 ];
 
-// Alphabetical GICS Sector Identifier Hierarchy
-const SECTORS_LIST = [
-    'Communication Services',
-    'Consumer Discretionary',
-    'Consumer Staples',
-    'Energy',
-    'Financials',
-    'Health Care',
-    'Industrials',
-    'Information Technology',
-    'Materials',
-    'Real Estate',
-    'Utilities'
-];
-
-const SECTOR_TO_ID = {
-    'Unknown': 0,
-    'Communication Services': 1,
-    'Consumer Discretionary': 2,
-    'Consumer Staples': 3,
-    'Energy': 4,
-    'Financials': 5,
-    'Health Care': 6,
-    'Industrials': 7,
-    'Information Technology': 8,
-    'Materials': 9,
-    'Real Estate': 10,
-    'Utilities': 11
-};
-
-// ==============================================================================
-// COMPLETE & EXHAUSTIVE 503-STOCK GICS SECTOR MAPPING TABLE
-// ==============================================================================
 const TICKER_GICS_SECTORS = {
-    'A': 'Health Care',
-    'AAPL': 'Information Technology',
-    'ABBV': 'Health Care',
-    'ABNB': 'Consumer Discretionary',
-    'ABT': 'Health Care',
-    'ACGL': 'Financials',
-    'ACN': 'Information Technology',
-    'ADBE': 'Information Technology',
-    'ADI': 'Information Technology',
-    'ADM': 'Consumer Staples',
-    'ADP': 'Industrials',
-    'ADSK': 'Information Technology',
-    'AEE': 'Utilities',
-    'AEP': 'Utilities',
-    'AES': 'Utilities',
-    'AFL': 'Financials',
-    'AIG': 'Financials',
-    'AIZ': 'Financials',
-    'AJG': 'Financials',
-    'AKAM': 'Information Technology',
-    'ALB': 'Materials',
-    'ALGN': 'Health Care',
-    'ALL': 'Financials',
-    'ALLE': 'Industrials',
-    'AMAT': 'Information Technology',
-    'AMCR': 'Materials',
-    'AMD': 'Information Technology',
-    'AME': 'Industrials',
-    'AMGN': 'Health Care',
-    'AMP': 'Financials',
-    'AMT': 'Real Estate',
-    'AMZN': 'Consumer Discretionary',
-    'ANET': 'Information Technology',
-    'ANSS': 'Information Technology',
-    'AON': 'Financials',
-    'AOS': 'Industrials',
-    'APA': 'Energy',
-    'APD': 'Materials',
-    'APH': 'Information Technology',
-    'APTV': 'Consumer Discretionary',
-    'ARE': 'Real Estate',
-    'ATO': 'Utilities',
-    'AVB': 'Real Estate',
-    'AVGO': 'Information Technology',
-    'AVY': 'Materials',
-    'AWK': 'Utilities',
-    'AXON': 'Industrials',
-    'AXP': 'Financials',
-    'AZO': 'Consumer Discretionary',
-    'BA': 'Industrials',
-    'BAC': 'Financials',
-    'BALL': 'Materials',
-    'BAX': 'Health Care',
-    'BBWI': 'Consumer Discretionary',
-    'BBY': 'Consumer Discretionary',
-    'BDX': 'Health Care',
-    'BEN': 'Financials',
-    'BF-B': 'Consumer Staples',
-    'BG': 'Consumer Staples',
-    'BIIB': 'Health Care',
-    'BK': 'Financials',
-    'BKNG': 'Consumer Discretionary',
-    'BKR': 'Energy',
-    'BLDR': 'Industrials',
-    'BLK': 'Financials',
-    'BMY': 'Health Care',
-    'BR': 'Industrials',
-    'BRK-B': 'Financials',
-    'BRO': 'Financials',
-    'BSX': 'Health Care',
-    'BWA': 'Consumer Discretionary',
-    'BX': 'Financials',
-    'BXP': 'Real Estate',
-    'C': 'Financials',
-    'CAG': 'Consumer Staples',
-    'CAH': 'Health Care',
-    'CARR': 'Industrials',
-    'CAT': 'Industrials',
-    'CB': 'Financials',
-    'CBOE': 'Financials',
-    'CBRE': 'Real Estate',
-    'CCI': 'Real Estate',
-    'CCL': 'Consumer Discretionary',
-    'CDNS': 'Information Technology',
-    'CDW': 'Information Technology',
-    'CE': 'Materials',
-    'CEG': 'Utilities',
-    'CF': 'Materials',
-    'CFG': 'Financials',
-    'CHD': 'Consumer Staples',
-    'CHRW': 'Industrials',
-    'CHTR': 'Communication Services',
-    'CI': 'Health Care',
-    'CINF': 'Financials',
-    'CL': 'Consumer Staples',
-    'CLX': 'Consumer Staples',
-    'CMCSA': 'Communication Services',
-    'CME': 'Financials',
-    'CMG': 'Consumer Discretionary',
-    'CMI': 'Industrials',
-    'CMS': 'Utilities',
-    'CNC': 'Health Care',
-    'CNP': 'Utilities',
-    'COF': 'Financials',
-    'COO': 'Health Care',
-    'COP': 'Energy',
-    'COR': 'Health Care',
-    'COST': 'Consumer Staples',
-    'CPAY': 'Financials',
-    'CPB': 'Consumer Staples',
-    'CPRT': 'Industrials',
-    'CPT': 'Real Estate',
-    'CRL': 'Health Care',
-    'CRM': 'Information Technology',
-    'CRWD': 'Information Technology',
-    'CSCO': 'Information Technology',
-    'CSGP': 'Real Estate',
-    'CSX': 'Industrials',
-    'CTAS': 'Industrials',
-    'CTLT': 'Health Care',
-    'CTRA': 'Energy',
-    'CTSH': 'Information Technology',
-    'CTVA': 'Materials',
-    'CVS': 'Health Care',
-    'CVX': 'Energy',
-    'CZR': 'Consumer Discretionary',
-    'D': 'Utilities',
-    'DAL': 'Industrials',
-    'DAY': 'Industrials',
-    'DD': 'Materials',
-    'DE': 'Industrials',
-    'DECK': 'Consumer Discretionary',
-    'DELL': 'Information Technology',
-    'DFS': 'Financials',
-    'DG': 'Consumer Staples',
-    'DGX': 'Health Care',
-    'DHI': 'Consumer Discretionary',
-    'DHR': 'Health Care',
-    'DIS': 'Communication Services',
-    'DLR': 'Real Estate',
-    'DLTR': 'Consumer Staples',
-    'DOC': 'Real Estate',
-    'DOV': 'Industrials',
-    'DOW': 'Materials',
-    'DPZ': 'Consumer Discretionary',
-    'DRI': 'Consumer Discretionary',
-    'DTE': 'Utilities',
-    'DUK': 'Utilities',
-    'DVA': 'Health Care',
-    'DVN': 'Energy',
-    'DXCM': 'Health Care',
-    'EA': 'Communication Services',
-    'EBAY': 'Consumer Discretionary',
-    'ECL': 'Materials',
-    'ED': 'Utilities',
-    'EFX': 'Industrials',
-    'EG': 'Financials',
-    'EIX': 'Utilities',
-    'EL': 'Consumer Staples',
-    'ELV': 'Health Care',
-    'EMN': 'Materials',
-    'EMR': 'Industrials',
-    'ENPH': 'Information Technology',
-    'EOG': 'Energy',
-    'EPAM': 'Information Technology',
-    'EQIX': 'Real Estate',
-    'EQR': 'Real Estate',
-    'EQT': 'Energy',
-    'ERIE': 'Financials',
-    'ES': 'Utilities',
-    'ESS': 'Real Estate',
-    'ETN': 'Industrials',
-    'ETR': 'Utilities',
-    'EVRG': 'Utilities',
-    'EW': 'Health Care',
-    'EXC': 'Utilities',
-    'EXPD': 'Industrials',
-    'EXPE': 'Consumer Discretionary',
-    'EXR': 'Real Estate',
-    'F': 'Consumer Discretionary',
-    'FANG': 'Energy',
-    'FAST': 'Industrials',
-    'FCX': 'Materials',
-    'FDS': 'Financials',
-    'FDX': 'Industrials',
-    'FE': 'Utilities',
-    'FFIV': 'Information Technology',
-    'FI': 'Financials',
-    'FICO': 'Information Technology',
-    'FIS': 'Financials',
-    'FITB': 'Financials',
-    'FMC': 'Materials',
-    'FOX': 'Communication Services',
-    'FOXA': 'Communication Services',
-    'FRT': 'Real Estate',
-    'FSLR': 'Information Technology',
-    'FTNT': 'Information Technology',
-    'FTV': 'Industrials',
-    'GD': 'Industrials',
-    'GDDY': 'Information Technology',
-    'GE': 'Industrials',
-    'GEHC': 'Health Care',
-    'GEN': 'Information Technology',
-    'GEV': 'Industrials',
-    'GILD': 'Health Care',
-    'GIS': 'Consumer Staples',
-    'GL': 'Financials',
-    'GLW': 'Information Technology',
-    'GM': 'Consumer Discretionary',
-    'GNRC': 'Industrials',
-    'GOOG': 'Communication Services',
-    'GOOGL': 'Communication Services',
-    'GPC': 'Consumer Discretionary',
-    'GPN': 'Financials',
-    'GRMN': 'Consumer Discretionary',
-    'GS': 'Financials',
-    'GWW': 'Industrials',
-    'HAL': 'Energy',
-    'HAS': 'Consumer Discretionary',
-    'HBAN': 'Financials',
-    'HCA': 'Health Care',
-    'HD': 'Consumer Discretionary',
-    'HES': 'Energy',
-    'HIG': 'Financials',
-    'HII': 'Industrials',
-    'HLT': 'Consumer Discretionary',
-    'HOLX': 'Health Care',
-    'HON': 'Industrials',
-    'HPE': 'Information Technology',
-    'HPQ': 'Information Technology',
-    'HRL': 'Consumer Staples',
-    'HSIC': 'Health Care',
-    'HST': 'Real Estate',
-    'HSY': 'Consumer Staples',
-    'HUBB': 'Industrials',
-    'HUM': 'Health Care',
-    'HWM': 'Industrials',
-    'IBM': 'Information Technology',
-    'ICE': 'Financials',
-    'IDXX': 'Health Care',
-    'IEX': 'Industrials',
-    'IFF': 'Materials',
-    'INCY': 'Health Care',
-    'INTC': 'Information Technology',
-    'INTU': 'Information Technology',
-    'INVH': 'Real Estate',
-    'IP': 'Materials',
-    'IPG': 'Communication Services',
-    'IQV': 'Health Care',
-    'IR': 'Industrials',
-    'IRM': 'Real Estate',
-    'ISRG': 'Health Care',
-    'IT': 'Information Technology',
-    'ITW': 'Industrials',
-    'IVZ': 'Financials',
-    'J': 'Industrials',
-    'JBHT': 'Industrials',
-    'JBL': 'Information Technology',
-    'JCI': 'Industrials',
-    'JKHY': 'Financials',
-    'JNJ': 'Health Care',
-    'JNPR': 'Information Technology',
-    'JPM': 'Financials',
-    'K': 'Consumer Staples',
-    'KDP': 'Consumer Staples',
-    'KEY': 'Financials',
-    'KEYS': 'Information Technology',
-    'KHC': 'Consumer Staples',
-    'KIM': 'Real Estate',
-    'KKR': 'Financials',
-    'KLAC': 'Information Technology',
-    'KMB': 'Consumer Staples',
-    'KMI': 'Energy',
-    'KMX': 'Consumer Discretionary',
-    'KO': 'Consumer Staples',
-    'KR': 'Consumer Staples',
-    'KVUE': 'Consumer Staples',
-    'L': 'Financials',
-    'LDOS': 'Industrials',
-    'LEN': 'Consumer Discretionary',
-    'LH': 'Health Care',
-    'LHX': 'Industrials',
-    'LIN': 'Materials',
-    'LKQ': 'Consumer Discretionary',
-    'LLY': 'Health Care',
-    'LMT': 'Industrials',
-    'LNT': 'Utilities',
-    'LOW': 'Consumer Discretionary',
-    'LRCX': 'Information Technology',
-    'LULU': 'Consumer Discretionary',
-    'LUV': 'Industrials',
-    'LVS': 'Consumer Discretionary',
-    'LW': 'Consumer Staples',
-    'LYB': 'Materials',
-    'LYV': 'Communication Services',
-    'MA': 'Financials',
-    'MAA': 'Real Estate',
-    'MAR': 'Consumer Discretionary',
-    'MAS': 'Industrials',
-    'MCD': 'Consumer Discretionary',
-    'MCHP': 'Information Technology',
-    'MCK': 'Health Care',
-    'MCO': 'Financials',
-    'MDLZ': 'Consumer Staples',
-    'MDT': 'Health Care',
-    'MET': 'Financials',
-    'META': 'Communication Services',
-    'MGM': 'Consumer Discretionary',
-    'MHK': 'Consumer Discretionary',
-    'MKC': 'Consumer Staples',
-    'MKTX': 'Financials',
-    'MLM': 'Materials',
-    'MMC': 'Financials',
-    'MMM': 'Industrials',
-    'MNST': 'Consumer Staples',
-    'MO': 'Consumer Staples',
-    'MOH': 'Health Care',
-    'MOS': 'Materials',
-    'MPC': 'Energy',
-    'MPWR': 'Information Technology',
-    'MRK': 'Health Care',
-    'MRNA': 'Health Care',
-    'MS': 'Financials',
-    'MSCI': 'Financials',
-    'MSFT': 'Information Technology',
-    'MSI': 'Information Technology',
-    'MTB': 'Financials',
-    'MTCH': 'Communication Services',
-    'MTD': 'Health Care',
-    'MU': 'Information Technology',
-    'NCLH': 'Consumer Discretionary',
-    'NDAQ': 'Financials',
-    'NDSN': 'Industrials',
-    'NEE': 'Utilities',
-    'NEM': 'Materials',
-    'NFLX': 'Communication Services',
-    'NI': 'Utilities',
-    'NKE': 'Consumer Discretionary',
-    'NOC': 'Industrials',
-    'NOW': 'Information Technology',
-    'NRG': 'Utilities',
-    'NSC': 'Industrials',
-    'NTAP': 'Information Technology',
-    'NTRS': 'Financials',
-    'NUE': 'Materials',
-    'NVDA': 'Information Technology',
-    'NVR': 'Consumer Discretionary',
-    'NWS': 'Communication Services',
-    'NWSA': 'Communication Services',
-    'NXPI': 'Information Technology',
-    'O': 'Real Estate',
-    'ODFL': 'Industrials',
-    'OKE': 'Energy',
-    'OMC': 'Communication Services',
-    'ON': 'Information Technology',
-    'ORCL': 'Information Technology',
-    'ORLY': 'Consumer Discretionary',
-    'OTIS': 'Industrials',
-    'OXY': 'Energy',
-    'PANW': 'Information Technology',
-    'PARA': 'Communication Services',
-    'PAYC': 'Industrials',
-    'PAYX': 'Industrials',
-    'PCAR': 'Industrials',
-    'PCG': 'Utilities',
-    'PEG': 'Utilities',
-    'PEP': 'Consumer Staples',
-    'PFE': 'Health Care',
-    'PFG': 'Financials',
-    'PG': 'Consumer Staples',
-    'PGR': 'Financials',
-    'PH': 'Industrials',
-    'PHM': 'Consumer Discretionary',
-    'PKG': 'Materials',
-    'PLD': 'Real Estate',
-    'PLTR': 'Information Technology',
-    'PM': 'Consumer Staples',
-    'PNC': 'Financials',
-    'PNR': 'Industrials',
-    'PNW': 'Utilities',
-    'PODD': 'Health Care',
-    'POOL': 'Consumer Discretionary',
-    'PPG': 'Materials',
-    'PPL': 'Utilities',
-    'PRU': 'Financials',
-    'PSA': 'Real Estate',
-    'PSX': 'Energy',
-    'PTC': 'Information Technology',
-    'PWR': 'Industrials',
-    'PYPL': 'Financials',
-    'QCOM': 'Information Technology',
-    'QRVO': 'Information Technology',
-    'RCL': 'Consumer Discretionary',
-    'REG': 'Real Estate',
-    'REGN': 'Health Care',
-    'RF': 'Financials',
-    'RHI': 'Industrials',
-    'RJF': 'Financials',
-    'RL': 'Consumer Discretionary',
-    'RMD': 'Health Care',
-    'ROK': 'Industrials',
-    'ROL': 'Industrials',
-    'ROP': 'Information Technology',
-    'ROST': 'Consumer Discretionary',
-    'RSG': 'Industrials',
-    'RTX': 'Industrials',
-    'RVTY': 'Health Care',
-    'SBAC': 'Real Estate',
-    'SBUX': 'Consumer Discretionary',
-    'SCHW': 'Financials',
-    'SHW': 'Materials',
-    'SJM': 'Consumer Staples',
-    'SLB': 'Energy',
-    'SMCI': 'Information Technology',
-    'SNA': 'Industrials',
-    'SNPS': 'Information Technology',
-    'SO': 'Utilities',
-    'SOLV': 'Health Care',
-    'SPG': 'Real Estate',
-    'SPGI': 'Financials',
-    'SRE': 'Utilities',
-    'STE': 'Health Care',
-    'STLD': 'Materials',
-    'STT': 'Financials',
-    'STX': 'Information Technology',
-    'STZ': 'Consumer Staples',
-    'SWK': 'Industrials',
-    'SWKS': 'Information Technology',
-    'SYF': 'Financials',
-    'SYK': 'Health Care',
-    'SYY': 'Consumer Staples',
-    'T': 'Communication Services',
-    'TAP': 'Consumer Staples',
-    'TDG': 'Industrials',
-    'TDY': 'Information Technology',
-    'TECH': 'Health Care',
-    'TEL': 'Information Technology',
-    'TER': 'Information Technology',
-    'TFC': 'Financials',
-    'TFX': 'Health Care',
-    'TGT': 'Consumer Staples',
-    'TJX': 'Consumer Discretionary',
-    'TMO': 'Health Care',
-    'TMUS': 'Communication Services',
-    'TPR': 'Consumer Discretionary',
-    'TRGP': 'Energy',
-    'TRMB': 'Information Technology',
-    'TROW': 'Financials',
-    'TRV': 'Financials',
-    'TSCO': 'Consumer Discretionary',
-    'TSLA': 'Consumer Discretionary',
-    'TSN': 'Consumer Staples',
-    'TT': 'Industrials',
-    'TTWO': 'Communication Services',
-    'TXN': 'Information Technology',
-    'TXT': 'Industrials',
-    'TYL': 'Information Technology',
-    'UAL': 'Industrials',
-    'UBER': 'Industrials',
-    'UDR': 'Real Estate',
-    'UHS': 'Health Care',
-    'ULTA': 'Consumer Discretionary',
-    'UNH': 'Health Care',
-    'UNP': 'Industrials',
-    'UPS': 'Industrials',
-    'URI': 'Industrials',
-    'USB': 'Financials',
-    'V': 'Financials',
-    'VICI': 'Real Estate',
-    'VLO': 'Energy',
-    'VLTO': 'Industrials',
-    'VMC': 'Materials',
-    'VRSK': 'Industrials',
-    'VRSN': 'Information Technology',
-    'VRTX': 'Health Care',
-    'VST': 'Utilities',
-    'VTR': 'Real Estate',
-    'VTRS': 'Health Care',
-    'VZ': 'Communication Services',
-    'WAB': 'Industrials',
-    'WAT': 'Health Care',
-    'WBA': 'Consumer Staples',
-    'WBD': 'Communication Services',
-    'WDC': 'Information Technology',
-    'WEC': 'Utilities',
-    'WELL': 'Real Estate',
-    'WFC': 'Financials',
-    'WM': 'Industrials',
-    'WMB': 'Energy',
-    'WMT': 'Consumer Staples',
-    'WRB': 'Financials',
-    'WST': 'Health Care',
-    'WTW': 'Financials',
-    'WY': 'Real Estate',
-    'WYNN': 'Consumer Discretionary',
-    'XEL': 'Utilities',
-    'XOM': 'Energy',
-    'XYL': 'Industrials',
-    'YUM': 'Consumer Discretionary',
-    'ZBH': 'Health Care',
-    'ZBRA': 'Information Technology',
-    'ZTS': 'Health Care'
+    'A': 'Healthcare', 'AAPL': 'Technology', 'ABBV': 'Healthcare', 'ABNB': 'Discretionary', 'ABT': 'Healthcare',
+    'ACGL': 'Financials', 'ACN': 'Technology', 'ADBE': 'Technology', 'ADI': 'Technology', 'ADM': 'Staples',
+    'ADP': 'Industrials', 'ADSK': 'Technology', 'AEE': 'Utilities', 'AEP': 'Utilities', 'AES': 'Utilities',
+    'AFL': 'Financials', 'AIG': 'Financials', 'AIZ': 'Financials', 'AJG': 'Financials', 'AKAM': 'Technology',
+    'ALB': 'Materials', 'ALGN': 'Healthcare', 'ALL': 'Financials', 'ALLE': 'Industrials', 'AMAT': 'Technology',
+    'AMCR': 'Materials', 'AMD': 'Technology', 'AME': 'Industrials', 'AMGN': 'Healthcare', 'AMP': 'Financials',
+    'AMT': 'RealEstate', 'AMZN': 'Discretionary', 'ANET': 'Technology', 'ANSS': 'Technology', 'AON': 'Financials',
+    'AOS': 'Industrials', 'APA': 'Energy', 'APD': 'Materials', 'APH': 'Technology', 'APTV': 'Discretionary',
+    'ARE': 'RealEstate', 'ATO': 'Utilities', 'AVB': 'RealEstate', 'AVGO': 'Technology', 'AVY': 'Materials',
+    'AWK': 'Utilities', 'AXON': 'Industrials', 'AXP': 'Financials', 'AZO': 'Discretionary', 'BA': 'Industrials',
+    'BAC': 'Financials', 'BALL': 'Materials', 'BAX': 'Healthcare', 'BBWI': 'Discretionary', 'BBY': 'Discretionary',
+    'BDX': 'Healthcare', 'BEN': 'Financials', 'BF-B': 'Staples', 'BG': 'Staples', 'BIIB': 'Healthcare',
+    'BK': 'Financials', 'BKNG': 'Discretionary', 'BKR': 'Energy', 'BLDR': 'Industrials', 'BLK': 'Financials',
+    'BMY': 'Healthcare', 'BR': 'Industrials', 'BRK-B': 'Financials', 'BRO': 'Financials', 'BSX': 'Healthcare',
+    'BWA': 'Discretionary', 'BX': 'Financials', 'BXP': 'RealEstate', 'C': 'Financials', 'CAG': 'Staples',
+    'CAH': 'Healthcare', 'CARR': 'Industrials', 'CAT': 'Industrials', 'CB': 'Financials', 'CBOE': 'Financials',
+    'CBRE': 'RealEstate', 'CCI': 'RealEstate', 'CCL': 'Discretionary', 'CDNS': 'Technology', 'CDW': 'Technology',
+    'CE': 'Materials', 'CEG': 'Utilities', 'CF': 'Materials', 'CFG': 'Financials', 'CHD': 'Staples',
+    'CHRW': 'Industrials', 'CHTR': 'Communication', 'CI': 'Healthcare', 'CINF': 'Financials', 'CL': 'Staples',
+    'CLX': 'Staples', 'CMCSA': 'Communication', 'CME': 'Financials', 'CMG': 'Discretionary', 'CMI': 'Industrials',
+    'CMS': 'Utilities', 'CNC': 'Healthcare', 'CNP': 'Utilities', 'COF': 'Financials', 'COO': 'Healthcare',
+    'COP': 'Energy', 'COR': 'Healthcare', 'COST': 'Staples', 'CPAY': 'Financials', 'CPB': 'Staples',
+    'CPRT': 'Industrials', 'CPT': 'RealEstate', 'CRL': 'Healthcare', 'CRM': 'Technology', 'CRWD': 'Technology',
+    'CSCO': 'Technology', 'CSGP': 'RealEstate', 'CSX': 'Industrials', 'CTAS': 'Industrials', 'CTLT': 'Healthcare',
+    'CTRA': 'Energy', 'CTSH': 'Technology', 'CTVA': 'Materials', 'CVS': 'Healthcare', 'CVX': 'Energy',
+    'CZR': 'Discretionary', 'D': 'Utilities', 'DAL': 'Industrials', 'DAY': 'Industrials', 'DD': 'Materials',
+    'DE': 'Industrials', 'DECK': 'Discretionary', 'DELL': 'Technology', 'DFS': 'Financials', 'DG': 'Staples',
+    'DGX': 'Healthcare', 'DHI': 'Discretionary', 'DHR': 'Healthcare', 'DIS': 'Communication', 'DLR': 'RealEstate',
+    'DLTR': 'Staples', 'DOC': 'RealEstate', 'DOV': 'Industrials', 'DOW': 'Materials', 'DPZ': 'Discretionary',
+    'DRI': 'Discretionary', 'DTE': 'Utilities', 'DUK': 'Utilities', 'DVA': 'Healthcare', 'DVN': 'Energy',
+    'DXCM': 'Healthcare', 'EA': 'Communication', 'EBAY': 'Discretionary', 'ECL': 'Materials', 'ED': 'Utilities',
+    'EFX': 'Industrials', 'EG': 'Financials', 'EIX': 'Utilities', 'EL': 'Staples', 'ELV': 'Healthcare',
+    'EMN': 'Materials', 'EMR': 'Industrials', 'ENPH': 'Technology', 'EOG': 'Energy', 'EPAM': 'Technology',
+    'EQIX': 'RealEstate', 'EQR': 'RealEstate', 'EQT': 'Energy', 'ERIE': 'Financials', 'ES': 'Utilities',
+    'ESS': 'RealEstate', 'ETN': 'Industrials', 'ETR': 'Utilities', 'EVRG': 'Utilities', 'EW': 'Healthcare',
+    'EXC': 'Utilities', 'EXPD': 'Industrials', 'EXPE': 'Discretionary', 'EXR': 'RealEstate', 'F': 'Discretionary',
+    'FANG': 'Energy', 'FAST': 'Industrials', 'FCX': 'Materials', 'FDS': 'Financials', 'FDX': 'Industrials',
+    'FE': 'Utilities', 'FFIV': 'Technology', 'FI': 'Financials', 'FICO': 'Technology', 'FIS': 'Financials',
+    'FITB': 'Financials', 'FMC': 'Materials', 'FOX': 'Communication', 'FOXA': 'Communication', 'FRT': 'RealEstate',
+    'FSLR': 'Technology', 'FTNT': 'Technology', 'FTV': 'Industrials', 'GD': 'Industrials', 'GDDY': 'Technology',
+    'GE': 'Industrials', 'GEHC': 'Healthcare', 'GEN': 'Technology', 'GEV': 'Industrials', 'GILD': 'Healthcare',
+    'GIS': 'Staples', 'GL': 'Financials', 'GLW': 'Technology', 'GM': 'Discretionary', 'GNRC': 'Industrials',
+    'GOOG': 'Communication', 'GOOGL': 'Communication', 'GPC': 'Discretionary', 'GPN': 'Financials', 'GRMN': 'Discretionary',
+    'GS': 'Financials', 'GWW': 'Industrials', 'HAL': 'Energy', 'HAS': 'Discretionary', 'HBAN': 'Financials',
+    'HCA': 'Healthcare', 'HD': 'Discretionary', 'HES': 'Energy', 'HIG': 'Financials', 'HII': 'Industrials',
+    'HLT': 'Discretionary', 'HOLX': 'Healthcare', 'HON': 'Industrials', 'HPE': 'Technology', 'HPQ': 'Technology',
+    'HRL': 'Staples', 'HSIC': 'Healthcare', 'HST': 'RealEstate', 'HSY': 'Staples', 'HUBB': 'Industrials',
+    'HUM': 'Healthcare', 'HWM': 'Industrials', 'IBM': 'Technology', 'ICE': 'Financials', 'IDXX': 'Healthcare',
+    'IEX': 'Industrials', 'IFF': 'Materials', 'INCY': 'Healthcare', 'INTC': 'Technology', 'INTU': 'Technology',
+    'INVH': 'RealEstate', 'IP': 'Materials', 'IPG': 'Communication', 'IQV': 'Healthcare', 'IR': 'Industrials',
+    'IRM': 'RealEstate', 'ISRG': 'Healthcare', 'IT': 'Technology', 'ITW': 'Industrials', 'IVZ': 'Financials',
+    'J': 'Industrials', 'JBHT': 'Industrials', 'JBL': 'Technology', 'JCI': 'Industrials', 'JKHY': 'Financials',
+    'JNJ': 'Healthcare', 'JNPR': 'Technology', 'JPM': 'Financials', 'K': 'Staples', 'KDP': 'Staples',
+    'KEY': 'Financials', 'KEYS': 'Technology', 'KHC': 'Staples', 'KIM': 'RealEstate', 'KKR': 'Financials',
+    'KLAC': 'Technology', 'KMB': 'Staples', 'KMI': 'Energy', 'KMX': 'Discretionary', 'KO': 'Staples',
+    'KR': 'Staples', 'KVUE': 'Staples', 'L': 'Financials', 'LDOS': 'Industrials', 'LEN': 'Discretionary',
+    'LH': 'Healthcare', 'LHX': 'Industrials', 'LIN': 'Materials', 'LKQ': 'Discretionary', 'LLY': 'Healthcare',
+    'LMT': 'Industrials', 'LNT': 'Utilities', 'LOW': 'Discretionary', 'LRCX': 'Technology', 'LULU': 'Discretionary',
+    'LUV': 'Industrials', 'LVS': 'Discretionary', 'LW': 'Staples', 'LYB': 'Materials', 'LYV': 'Communication',
+    'MA': 'Financials', 'MAA': 'RealEstate', 'MAR': 'Discretionary', 'MAS': 'Industrials', 'MCD': 'Discretionary',
+    'MCHP': 'Technology', 'MCK': 'Healthcare', 'MCO': 'Financials', 'MDLZ': 'Staples', 'MDT': 'Healthcare',
+    'MET': 'Financials', 'META': 'Communication', 'MGM': 'Discretionary', 'MHK': 'Discretionary', 'MKC': 'Staples',
+    'MKTX': 'Financials', 'MLM': 'Materials', 'MMC': 'Financials', 'MMM': 'Industrials', 'MNST': 'Staples',
+    'MO': 'Staples', 'MOH': 'Healthcare', 'MOS': 'Materials', 'MPC': 'Energy', 'MPWR': 'Technology',
+    'MRK': 'Healthcare', 'MRNA': 'Healthcare', 'MS': 'Financials', 'MSCI': 'Financials', 'MSFT': 'Technology',
+    'MSI': 'Technology', 'MTB': 'Financials', 'MTCH': 'Communication', 'MTD': 'Healthcare', 'MU': 'Technology',
+    'NCLH': 'Discretionary', 'NDAQ': 'Financials', 'NDSN': 'Industrials', 'NEE': 'Utilities', 'NEM': 'Materials',
+    'NFLX': 'Communication', 'NI': 'Utilities', 'NKE': 'Discretionary', 'NOC': 'Industrials', 'NOW': 'Technology',
+    'NRG': 'Utilities', 'NSC': 'Industrials', 'NTAP': 'Technology', 'NTRS': 'Financials', 'NUE': 'Materials',
+    'NVDA': 'Technology', 'NVR': 'Discretionary', 'NWS': 'Communication', 'NWSA': 'Communication', 'NXPI': 'Technology',
+    'O': 'RealEstate', 'ODFL': 'Industrials', 'OKE': 'Energy', 'OMC': 'Communication', 'ON': 'Technology',
+    'ORCL': 'Technology', 'ORLY': 'Discretionary', 'OTIS': 'Industrials', 'OXY': 'Energy', 'PANW': 'Technology',
+    'PAYC': 'Industrials', 'PAYX': 'Industrials', 'PCAR': 'Industrials', 'PCG': 'Utilities',
+    'PEG': 'Utilities', 'PEP': 'Staples', 'PFE': 'Healthcare', 'PFG': 'Financials', 'PG': 'Staples',
+    'PGR': 'Financials', 'PH': 'Industrials', 'PHM': 'Discretionary', 'PKG': 'Materials', 'PLD': 'RealEstate',
+    'PLTR': 'Technology', 'PM': 'Staples', 'PNC': 'Financials', 'PNR': 'Industrials', 'PNW': 'Utilities',
+    'PODD': 'Healthcare', 'POOL': 'Discretionary', 'PPG': 'Materials', 'PPL': 'Utilities', 'PRU': 'Financials',
+    'PSA': 'RealEstate', 'PSKY': 'Communication', 'PSX': 'Energy', 'PTC': 'Technology', 'PWR': 'Industrials', 'PYPL': 'Financials',
+    'QCOM': 'Technology', 'QRVO': 'Technology', 'RCL': 'Discretionary', 'REG': 'RealEstate', 'REGN': 'Healthcare',
+    'RF': 'Financials', 'RHI': 'Industrials', 'RJF': 'Financials', 'RL': 'Discretionary', 'RMD': 'Healthcare',
+    'ROK': 'Industrials', 'ROL': 'Industrials', 'ROP': 'Technology', 'ROST': 'Discretionary', 'RSG': 'Industrials',
+    'RTX': 'Industrials', 'RVTY': 'Healthcare', 'SBAC': 'RealEstate', 'SBUX': 'Discretionary', 'SCHW': 'Financials',
+    'SHW': 'Materials', 'SJM': 'Staples', 'SLB': 'Energy', 'SMCI': 'Technology', 'SNA': 'Industrials',
+    'SNPS': 'Technology', 'SO': 'Utilities', 'SOLV': 'Healthcare', 'SPG': 'RealEstate', 'SPGI': 'Financials',
+    'SRE': 'Utilities', 'STE': 'Healthcare', 'STLD': 'Materials', 'STT': 'Financials', 'STX': 'Technology',
+    'STZ': 'Staples', 'SWK': 'Industrials', 'SWKS': 'Technology', 'SYF': 'Financials', 'SYK': 'Healthcare',
+    'SYY': 'Staples', 'T': 'Communication', 'TAP': 'Staples', 'TDG': 'Industrials', 'TDY': 'Technology',
+    'TECH': 'Healthcare', 'TEL': 'Technology', 'TER': 'Technology', 'TFC': 'Financials', 'TFX': 'Healthcare',
+    'TGT': 'Staples', 'TJX': 'Discretionary', 'TMO': 'Healthcare', 'TMUS': 'Communication', 'TPR': 'Discretionary',
+    'TRGP': 'Energy', 'TRMB': 'Technology', 'TROW': 'Financials', 'TRV': 'Financials', 'TSCO': 'Discretionary',
+    'TSLA': 'Discretionary', 'TSN': 'Staples', 'TT': 'Industrials', 'TTWO': 'Communication', 'TXN': 'Technology',
+    'TXT': 'Industrials', 'TYL': 'Technology', 'UAL': 'Industrials', 'UBER': 'Industrials', 'UDR': 'RealEstate',
+    'UHS': 'Healthcare', 'ULTA': 'Discretionary', 'UNH': 'Healthcare', 'UNP': 'Industrials', 'UPS': 'Industrials',
+    'URI': 'Industrials', 'USB': 'Financials', 'V': 'Financials', 'VICI': 'RealEstate', 'VLO': 'Energy',
+    'VLTO': 'Industrials', 'VMC': 'Materials', 'VRSK': 'Industrials', 'VRSN': 'Technology', 'VRTX': 'Healthcare',
+    'VST': 'Utilities', 'VTR': 'RealEstate', 'VTRS': 'Healthcare', 'VZ': 'Communication', 'WAB': 'Industrials',
+    'WAT': 'Healthcare', 'WBA': 'Staples', 'WBD': 'Communication', 'WDC': 'Technology', 'WEC': 'Utilities',
+    'WELL': 'RealEstate', 'WFC': 'Financials', 'WM': 'Industrials', 'WMB': 'Energy', 'WMT': 'Staples',
+    'WRB': 'Financials', 'WST': 'Healthcare', 'WTW': 'Financials', 'WY': 'RealEstate', 'WYNN': 'Discretionary',
+    'XEL': 'Utilities', 'XOM': 'Energy', 'XYL': 'Industrials', 'YUM': 'Discretionary', 'ZBH': 'Healthcare',
+    'ZBRA': 'Technology', 'ZTS': 'Healthcare'
 };
 
 // ==============================================================================
-// SECTION 2: MATHEMATICAL & STATISTICAL UTILITIES
+// SECTION 2: VECTORIZED MATHEMATICAL ENGINE
 // ==============================================================================
-
-function rollingMean(arr, window, minPeriods = 1) {
+function rollingMean(arr, window) {
     const n = arr.length;
     const out = new Float32Array(n);
-    let currentSum = 0.0;
-    const queue = [];
-
+    let sum = 0.0;
     for (let i = 0; i < n; i++) {
-        const val = Number.isFinite(arr[i]) ? arr[i] : 0.0;
-        queue.push(val);
-        currentSum += val;
-
-        if (queue.length > window) {
-            currentSum -= queue.shift();
-        }
-
-        if (queue.length >= minPeriods) {
-            out[i] = currentSum / queue.length;
-        } else {
-            out[i] = queue.length > 0 ? currentSum / queue.length : 0.0;
-        }
+        sum += arr[i];
+        if (i >= window) sum -= arr[i - window];
+        out[i] = i >= (window - 1) ? sum / window : NaN;
     }
     return out;
 }
 
-function sigmoid(z) {
-    if (z >= 0) {
-        const ez = Math.exp(-z);
-        return 1.0 / (1.0 + ez);
-    } else {
-        const ez = Math.exp(z);
-        return ez / (1.0 + ez);
+function rollingStd(arr, window) {
+    const n = arr.length;
+    const out = new Float32Array(n);
+    const mean = rollingMean(arr, window);
+    for (let i = window - 1; i < n; i++) {
+        let varSum = 0.0;
+        const m = mean[i];
+        for (let j = i - window + 1; j <= i; j++) {
+            const diff = arr[j] - m;
+            varSum += diff * diff;
+        }
+        out[i] = Math.sqrt(varSum / Math.max(1, window - 1));
     }
+    return out;
+}
+
+function ewm(arr, alpha) {
+    const n = arr.length;
+    const out = new Float32Array(n);
+    if (n === 0) return out;
+    out[0] = arr[0];
+    for (let i = 1; i < n; i++) {
+        const val = Number.isFinite(arr[i]) ? arr[i] : out[i - 1];
+        out[i] = (1.0 - alpha) * out[i - 1] + alpha * val;
+    }
+    return out;
 }
 
 function normalCDF(z) {
@@ -680,16 +270,14 @@ function normalCDF(z) {
 }
 
 // ==============================================================================
-// SECTION 3: TWO-TIER PERSISTENT DISK & REST INGESTION
+// SECTION 3: INGESTION & YAHOO FINANCE DATA PIPELINE
 // ==============================================================================
 const ohlcvMemoryCache = new Map();
 
 function getPersistentCacheDir(customDir = null) {
-    const target = customDir || process.env.QUANT_CACHE_DIR || path.join(__dirname, 'quant_cache');
+    const target = customDir || process.env.QUANT_CACHE_DIR || path.join(__dirname, 'sp500_quant_cache');
     try {
-        if (!fs.existsSync(target)) {
-            fs.mkdirSync(target, { recursive: true });
-        }
+        if (!fs.existsSync(target)) fs.mkdirSync(target, { recursive: true });
     } catch (e) {
         return path.join(__dirname, '.quant_cache_fallback');
     }
@@ -700,14 +288,12 @@ async function fetchRawOHLCV(ticker, rangeDays) {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=${rangeDays}d&includeAdjustedClose=true`;
     const response = await fetch(url, {
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)',
             'Accept': 'application/json'
         }
     });
 
-    if (!response.ok) {
-        throw new Error(`[Yahoo Finance Ingest] HTTP ${response.status} for ${ticker}`);
-    }
+    if (!response.ok) throw new Error(`[Yahoo Finance Ingest] HTTP ${response.status} for ${ticker}`);
 
     const payload = await response.json();
     const result = payload?.chart?.result?.[0];
@@ -715,6 +301,7 @@ async function fetchRawOHLCV(ticker, rangeDays) {
 
     const timestamps = result.timestamp || [];
     const quote = result.indicators?.quote?.[0] || {};
+    const adjClose = result.indicators?.adjclose?.[0]?.adjclose || [];
     const { open = [], high = [], low = [], close = [], volume = [] } = quote;
 
     const dates = [];
@@ -728,7 +315,7 @@ async function fetchRawOHLCV(ticker, rangeDays) {
         const o = Number(open[i]);
         const h = Number(high[i]);
         const l = Number(low[i]);
-        const c = Number(close[i]);
+        const c = Number(adjClose[i] || close[i]);
         const v = Number(volume[i]);
         const ts = timestamps[i];
 
@@ -739,21 +326,18 @@ async function fetchRawOHLCV(ticker, rangeDays) {
             highs.push(h);
             lows.push(l);
             closes.push(c);
-            volumes.push(Number.isFinite(v) ? v : 0);
+            volumes.push(Number.isFinite(v) ? v : 0.0);
         }
     }
 
-    if (dates.length === 0) return null;
+    if (dates.length < 60) return null;
     return { dates, opens, highs, lows, closes, volumes };
 }
 
 async function getOHLCV(ticker, rangeDays = STOCK_RANGE_DAYS, cacheDir = null) {
     const now = Date.now();
-
     const memEntry = ohlcvMemoryCache.get(ticker);
-    if (memEntry && (now - memEntry.fetchedAt) < CACHE_TTL_MS) {
-        return memEntry.data;
-    }
+    if (memEntry && (now - memEntry.fetchedAt) < CACHE_TTL_MS) return memEntry.data;
 
     const cDir = getPersistentCacheDir(cacheDir);
     const diskPath = path.join(cDir, `ohlcv_${ticker.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
@@ -770,14 +354,12 @@ async function getOHLCV(ticker, rangeDays = STOCK_RANGE_DAYS, cacheDir = null) {
                 }
             }
         }
-    } catch (diskReadErr) {}
+    } catch (e) {}
 
     const data = await fetchRawOHLCV(ticker, rangeDays);
     if (data) {
         ohlcvMemoryCache.set(ticker, { data, fetchedAt: now });
-        try {
-            fs.writeFileSync(diskPath, JSON.stringify(data), 'utf8');
-        } catch (diskWriteErr) {}
+        try { fs.writeFileSync(diskPath, JSON.stringify(data), 'utf8'); } catch (e) {}
     }
     return data;
 }
@@ -800,385 +382,372 @@ async function fetchManyOHLCV(tickers, rangeDays = STOCK_RANGE_DAYS, cacheDir = 
         }
 
         if (i + FETCH_BATCH_SIZE < tickers.length) {
-            await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+            await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
         }
     }
     return out;
 }
 
 // ==============================================================================
-// SECTION 4: 11-FEATURE STATIONARY FACTOR COMPUTATION
+// SECTION 4: 15-FEATURE COMPUTATION
 // ==============================================================================
-
-function computeStationaryFactors(series, spy5dReturnMap) {
+function computeRawSignals(series) {
     const { dates, opens, highs, lows, closes, volumes } = series;
     const n = closes.length;
-    if (n < 40) return null;
+    if (n < 55) return null;
 
-    const const2ln2minus1 = 2.0 * Math.LN2 - 1.0;
+    const c = Float32Array.from(closes);
+    const o = Float32Array.from(opens);
+    const h = Float32Array.from(highs);
+    const l = Float32Array.from(lows);
+    const v = Float32Array.from(volumes);
 
-    const retOvernight = new Float32Array(n);
-    const retIntraday = new Float32Array(n);
     const ret1d = new Float32Array(n);
     const ret5d = new Float32Array(n);
+    const ret10d = new Float32Array(n);
     const ret20d = new Float32Array(n);
+
+    for (let i = 0; i < n; i++) {
+        ret1d[i] = i >= 1 ? Math.log(c[i] / c[i - 1]) : 0.0;
+        ret5d[i] = i >= 5 ? Math.log(c[i] / c[i - 5]) : 0.0;
+        ret10d[i] = i >= 10 ? Math.log(c[i] / c[i - 10]) : 0.0;
+        ret20d[i] = i >= 20 ? Math.log(c[i] / c[i - 20]) : 0.0;
+    }
+
+    const gkVol = new Float32Array(n);
+    const parkinsonVol = new Float32Array(n);
+    const constGk = 2.0 * Math.LN2 - 1.0;
+    const constPark = 4.0 * Math.LN2;
+
+    for (let i = 0; i < n; i++) {
+        const logHL = Math.log(Math.max(h[i], 1e-8) / Math.max(l[i], 1e-8));
+        const logCO = Math.log(Math.max(c[i], 1e-8) / Math.max(o[i], 1e-8));
+        gkVol[i] = 0.5 * (logHL * logHL) - constGk * (logCO * logCO);
+        parkinsonVol[i] = (logHL * logHL) / constPark;
+    }
+
+    const delta = new Float32Array(n);
+    const gain = new Float32Array(n);
+    const loss = new Float32Array(n);
+    for (let i = 1; i < n; i++) {
+        delta[i] = c[i] - c[i - 1];
+        gain[i] = delta[i] > 0 ? delta[i] : 0.0;
+        loss[i] = delta[i] < 0 ? -delta[i] : 0.0;
+    }
+
+    const alphaRSI = 1.0 / 14.0;
+    const avgGain = ewm(gain, alphaRSI);
+    const avgLoss = ewm(loss, alphaRSI);
+    const rsi14 = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const rs = avgGain[i] / (avgLoss[i] + 1e-8);
+        const rsiRaw = 100.0 - (100.0 / (1.0 + rs));
+        rsi14[i] = (rsiRaw / 50.0) - 1.0;
+    }
+
+    const ema12 = ewm(c, 2.0 / (12 + 1));
+    const ema26 = ewm(c, 2.0 / (26 + 1));
+    const macd = new Float32Array(n);
+    const macdNorm = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        macd[i] = ema12[i] - ema26[i];
+        macdNorm[i] = macd[i] / (c[i] + 1e-8);
+    }
+    const macdSignal = ewm(macd, 2.0 / (9 + 1));
+    const macdHistNorm = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        macdHistNorm[i] = (macd[i] - macdSignal[i]) / (c[i] + 1e-8);
+    }
+
+    const sma20 = rollingMean(c, 20);
+    const std20 = rollingStd(c, 20);
+    const bbPctB = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const lower = sma20[i] - 2.0 * std20[i];
+        bbPctB[i] = (c[i] - lower) / (4.0 * std20[i] + 1e-8);
+    }
+
+    const volMa20 = rollingMean(v, 20);
+    const normVolume = new Float32Array(n);
     const hlSpread = new Float32Array(n);
-    const gkVarInstant = new Float32Array(n);
-    const dollarVol = new Float32Array(n);
-    const gain14 = new Float32Array(n);
-    const loss14 = new Float32Array(n);
+    const coSpread = new Float32Array(n);
+    const distSma20 = new Float32Array(n);
+    const distSma50 = new Float32Array(n);
+    const sma50 = rollingMean(c, 50);
 
     for (let i = 0; i < n; i++) {
-        const c = closes[i];
-        const o = opens[i];
-        const h = highs[i];
-        const l = lows[i];
-        const v = volumes[i];
-
-        // Microstructure Decomposition: Overnight Gap vs. Intraday Momentum
-        retOvernight[i] = i >= 1 ? Math.log(Math.max(o, 1e-8) / Math.max(closes[i - 1], 1e-8)) : 0.0;
-        retIntraday[i] = Math.log(Math.max(c, 1e-8) / Math.max(o, 1e-8));
-        ret1d[i] = retOvernight[i] + retIntraday[i];
-
-        ret5d[i] = i >= 5 ? Math.log(Math.max(c, 1e-8) / Math.max(closes[i - 5], 1e-8)) : 0.0;
-        ret20d[i] = i >= 20 ? Math.log(Math.max(c, 1e-8) / Math.max(closes[i - 20], 1e-8)) : 0.0;
-
-        hlSpread[i] = (h - l) / (c + 1e-8);
-
-        const logHL = Math.log(Math.max(h, 1e-8) / Math.max(l, 1e-8));
-        const logCO = Math.log(Math.max(c, 1e-8) / Math.max(o, 1e-8));
-        const gkV = 0.5 * (logHL * logHL) - const2ln2minus1 * (logCO * logCO);
-        gkVarInstant[i] = Math.sqrt(Math.max(gkV, 0.0));
-
-        dollarVol[i] = v * c;
-
-        if (i >= 1) {
-            const diff = c - closes[i - 1];
-            gain14[i] = diff > 0 ? diff : 0.0;
-            loss14[i] = diff < 0 ? -diff : 0.0;
-        }
+        normVolume[i] = Math.log((v[i] + 1.0) / (volMa20[i] + 1.0));
+        hlSpread[i] = (h[i] - l[i]) / (c[i] + 1e-8);
+        coSpread[i] = (c[i] - o[i]) / (o[i] + 1e-8);
+        distSma20[i] = (c[i] - sma20[i]) / (sma20[i] + 1e-8);
+        distSma50[i] = (c[i] - sma50[i]) / (sma50[i] + 1e-8);
     }
 
-    const gkVolSeries = rollingMean(gkVarInstant, 10, 5);
-    const volMa20Series = rollingMean(volumes, 20, 10);
-    const dollarVolMa20 = rollingMean(dollarVol, 20, 5);
-    const avgGain14 = rollingMean(gain14, 14, 10);
-    const avgLoss14 = rollingMean(loss14, 14, 10);
+    const realizedVol20 = rollingStd(ret1d, 20);
+    const currentVol = Number(realizedVol20[n - 1]) || 0.015;
 
-    const normVolSeries = new Float32Array(n);
-    const rsi14Series = new Float32Array(n);
-    const driftInstant = new Float32Array(n);
-    const amihudIlliqSeries = new Float32Array(n);
-
+    const dateFeatureMap = new Map();
     for (let i = 0; i < n; i++) {
-        const baseVol = volMa20Series[i];
-        normVolSeries[i] = baseVol > 0 ? (volumes[i] / (baseVol + 1e-8)) - 1.0 : 0.0;
-
-        const rs = avgGain14[i] / (avgLoss14[i] + 1e-8);
-        rsi14Series[i] = (100.0 - (100.0 / (1.0 + rs))) / 100.0 - 0.5;
-
-        driftInstant[i] = ret1d[i] * normVolSeries[i];
-
-        const amihudRaw = Math.abs(ret1d[i]) / (dollarVolMa20[i] * 1e-6 + 1e-4);
-        amihudIlliqSeries[i] = Math.log1p(amihudRaw);
-    }
-
-    const volPriceDriftSeries = rollingMean(driftInstant, 5, 3);
-    const recentGKVol = Number(gkVolSeries[n - 1]) || 0.015;
-    const stockVol5d = Math.max(1.10, Math.min(7.50, recentGKVol * Math.sqrt(5.0) * 100.0));
-
-    const factorsByDate = new Map();
-    for (let i = 0; i < n; i++) {
-        const d = dates[i];
-        const spy5d = spy5dReturnMap.get(d) || 0.0;
-        const spyLeadLag = ret5d[i] - spy5d;
+        if (i < 50) continue;
 
         const row = new Float32Array(NUM_FEATURES);
-        row[0] = retOvernight[i];
-        row[1] = retIntraday[i];
-        row[2] = ret5d[i];
+        row[0] = ret1d[i];
+        row[1] = ret5d[i];
+        row[2] = ret10d[i];
         row[3] = ret20d[i];
-        row[4] = hlSpread[i];
-        row[5] = gkVolSeries[i];
-        row[6] = normVolSeries[i];
-        row[7] = rsi14Series[i];
-        row[8] = volPriceDriftSeries[i];
-        row[9] = amihudIlliqSeries[i];
-        row[10] = spyLeadLag;
+        row[4] = gkVol[i];
+        row[5] = parkinsonVol[i];
+        row[6] = rsi14[i];
+        row[7] = macdNorm[i];
+        row[8] = macdHistNorm[i];
+        row[9] = bbPctB[i];
+        row[10] = normVolume[i];
+        row[11] = hlSpread[i];
+        row[12] = coSpread[i];
+        row[13] = distSma20[i];
+        row[14] = distSma50[i];
 
-        factorsByDate.set(d, row);
+        dateFeatureMap.set(dates[i], row);
     }
-
-    return { factorsByDate, stockVol5d, lastClose: closes[n - 1] };
-}
-
-async function prepareInferenceInputs(universeTickers, lookback = LOOKBACK, options = {}) {
-    const benchmarkSeries = await getOHLCV(BENCHMARK_TICKER, STOCK_RANGE_DAYS, options.cacheDir);
-    if (!benchmarkSeries || benchmarkSeries.closes.length < lookback + 25) {
-        throw new Error(`[InferenceEngine] Insufficient market benchmark series for ${BENCHMARK_TICKER}`);
-    }
-
-    const bDates = benchmarkSeries.dates;
-    const bCloses = benchmarkSeries.closes;
-    const nB = bCloses.length;
-
-    const spy5dReturnMap = new Map();
-    for (let i = 0; i < nB; i++) {
-        const ret5 = i >= 5 ? Math.log(bCloses[i] / (bCloses[i - 5] + 1e-8)) : 0.0;
-        spy5dReturnMap.set(bDates[i], ret5);
-    }
-
-    const spyMom20 = nB >= 20 ? (bCloses[nB - 1] / bCloses[nB - 20]) - 1.0 : 0.0;
-
-    const targetDates = bDates.slice(-lookback);
-    const activeSignalDate = targetDates[targetDates.length - 1];
-
-    const rawSeriesMap = await fetchManyOHLCV(universeTickers, STOCK_RANGE_DAYS, options.cacheDir);
-
-    const stockDataMap = new Map();
-    const stockVolsMap = new Map();
-    const stockPricesMap = new Map();
-
-    for (const ticker of universeTickers) {
-        const series = rawSeriesMap.get(ticker);
-        if (!series) continue;
-
-        const processed = computeStationaryFactors(series, spy5dReturnMap);
-        if (!processed) continue;
-
-        const { factorsByDate, stockVol5d, lastClose } = processed;
-        if (!factorsByDate.has(activeSignalDate)) continue;
-
-        const seq = new Float32Array(lookback * NUM_FEATURES);
-        let lastValidRow = null;
-        let missingCount = 0;
-
-        for (let t = 0; t < lookback; t++) {
-            const d = targetDates[t];
-            let row = factorsByDate.get(d);
-            if (!row) {
-                missingCount++;
-                row = lastValidRow || new Float32Array(NUM_FEATURES);
-            } else {
-                lastValidRow = row;
-            }
-            seq.set(row, t * NUM_FEATURES);
-        }
-
-        if (missingCount <= 5 && lastValidRow !== null) {
-            stockDataMap.set(ticker, seq);
-            stockVolsMap.set(ticker, stockVol5d);
-            stockPricesMap.set(ticker, lastClose);
-        }
-    }
-
-    const retList = [];
-    const hlList = [];
-    const normVolList = [];
-
-    const activeSignalIdx = (lookback - 1) * NUM_FEATURES;
-    for (const [, seq] of stockDataMap) {
-        const r1d = seq[activeSignalIdx + 0] + seq[activeSignalIdx + 1];
-        retList.push(r1d);
-        hlList.push(seq[activeSignalIdx + 4]);
-        normVolList.push(seq[activeSignalIdx + 6]);
-    }
-
-    const nAct = retList.length;
-    let meanRet = 0.0;
-    let meanHL = 0.0;
-    let meanNormVol = 0.0;
-    let dispersion = 0.0;
-
-    if (nAct > 0) {
-        meanRet = retList.reduce((a, b) => a + b, 0.0) / nAct;
-        meanHL = hlList.reduce((a, b) => a + b, 0.0) / nAct;
-        meanNormVol = normVolList.reduce((a, b) => a + b, 0.0) / nAct;
-
-        const varRet = retList.reduce((a, b) => a + (b - meanRet) ** 2, 0.0) / Math.max(1, nAct - 1);
-        dispersion = Math.sqrt(Math.max(varRet, 0.0));
-    }
-
-    const macroVector = new Float32Array([dispersion, meanRet, meanHL, meanNormVol]);
 
     return {
-        targetDates,
-        stockDataMap,
-        stockVolsMap,
-        stockPricesMap,
-        macroVector,
-        spyMom20
+        dateFeatureMap,
+        realizedVol: Math.max(0.005, currentVol),
+        lastClose: c[n - 1]
     };
 }
 
 // ==============================================================================
-// SECTION 5: ONNX MODEL INFERENCE PREDICTOR (V11 FAST ENGINE)
+// SECTION 5: CROSS-SECTIONAL PERCENTILE RANK NORMALIZATION
 // ==============================================================================
+function applyCrossSectionalRankScaling(activeSequences, N, seqLen) {
+    for (let t = 0; t < seqLen; t++) {
+        const tOffset = t * NUM_FEATURES;
 
+        for (let f = 0; f < NUM_FEATURES; f++) {
+            const featIdx = tOffset + f;
+            const items = new Array(N);
+
+            for (let s = 0; s < N; s++) {
+                const val = activeSequences[s][featIdx];
+                items[s] = { val: Number.isFinite(val) ? val : 0.0, sIdx: s };
+            }
+
+            items.sort((a, b) => a.val - b.val);
+
+            let i = 0;
+            while (i < N) {
+                let j = i;
+                while (j + 1 < N && Math.abs(items[j + 1].val - items[i].val) < 1e-12) {
+                    j++;
+                }
+
+                const avgRank = ((i + 1) + (j + 1)) / 2.0;
+                const pctRank = avgRank / N;
+                const scaled = (pctRank * 2.0) - 1.0;
+
+                for (let k = i; k <= j; k++) {
+                    activeSequences[items[k].sIdx][featIdx] = scaled;
+                }
+                i = j + 1;
+            }
+        }
+    }
+}
+
+// ==============================================================================
+// SECTION 6: ONNX MODEL INFERENCE PREDICTOR WITH VOLATILITY CALIBRATION
+// ==============================================================================
 class StockPredictor {
     constructor(modelPath = null) {
         this.modelPath = modelPath || this._resolveModelPath();
         this.session = null;
         this.inputNames = [];
         this.outputNames = [];
+
+        this.modelMaxStocks = DEFAULT_MAX_STOCKS;
+        this.modelSeqLen = DEFAULT_SEQ_LEN;
+        this.macroDim = DEFAULT_MACRO_DIM;
+
+        this.xInputName = null;
+        this.maskInputName = null;
+        this.secInputName = null;
+        this.macroInputName = null;
         this.maskIsBoolean = true;
     }
 
     _resolveModelPath() {
         const candidateNames = [
-            'Ocean.onnx',
-            'V5.2.2-4.onnx',
-            'breakthrough_upgraded_factor_model.onnx',
-            'breakthrough_rank_decay_model.onnx',
-            'V5.2.1-test.onnx'
+            'V6.onnx',
+            'sp500_hierarchical_itransformer.onnx',
+            'hierarchical_itransformer.onnx',
+            'best_hierarchical_model.onnx',
+            'itransformer.onnx',
+            'V5.2.2-4.onnx'
         ];
 
         const searchRoots = [
+            'C:\\Users\\abbon\\OneDrive\\Desktop\\Coding\\AI',
             __dirname,
             process.cwd(),
-            path.join(__dirname, 'quant_cache'),
-            path.join(process.cwd(), 'quant_cache'),
-            'C:\\Users\\abbon\\OneDrive\\Desktop\\Coding\\AI'
+            path.join(__dirname, 'sp500_quant_cache'),
+            path.join(process.cwd(), 'sp500_quant_cache')
         ];
 
         for (const root of searchRoots) {
             for (const name of candidateNames) {
                 const full = path.join(root, name);
-                if (fs.existsSync(full)) {
-                    return full;
-                }
+                if (fs.existsSync(full)) return full;
             }
         }
-        return path.join(__dirname, 'Ocean.onnx');
+        return path.join(__dirname, 'V6.onnx');
     }
 
     async init() {
         if (!this.session) {
-            const options = {
-                executionProviders: ['cpu'],
-                graphOptimizationLevel: 'all'
-            };
-
             if (!fs.existsSync(this.modelPath)) {
                 throw new Error(`[StockPredictor] ONNX model weights not found at '${this.modelPath}'.`);
             }
 
-            this.session = await ort.InferenceSession.create(this.modelPath, options);
+            this.session = await ort.InferenceSession.create(this.modelPath, {
+                executionProviders: ['cpu'],
+                graphOptimizationLevel: 'all'
+            });
+
             this.inputNames = this.session.inputNames || [];
             this.outputNames = this.session.outputNames || [];
 
-            const maskKey = this.inputNames.find(n => /mask/i.test(n)) || this.inputNames[2];
-            if (maskKey && this.session.inputMetadata && this.session.inputMetadata[maskKey]) {
-                const rawType = String(this.session.inputMetadata[maskKey].type).toLowerCase();
-                this.maskIsBoolean = rawType.includes('bool') || rawType === '';
+            for (const name of this.inputNames) {
+                const meta = this.session.inputMetadata?.[name];
+                const dims = meta?.dimensions || [];
+                const type = String(meta?.type || '').toLowerCase();
+
+                if (dims.length === 4 || (!this.xInputName && (name.includes('x') || name.includes('input') || name.includes('feat')))) {
+                    this.xInputName = name;
+                    if (typeof dims[1] === 'number' && dims[1] > 0) this.modelMaxStocks = dims[1];
+                    if (typeof dims[2] === 'number' && dims[2] > 0) this.modelSeqLen = dims[2];
+                } else if (/mask/i.test(name) || type.includes('bool') || (dims.length === 2 && !this.secInputName && !this.maskInputName)) {
+                    this.maskInputName = name;
+                    this.maskIsBoolean = type.includes('bool') || type === '';
+                } else if (/sec|sid/i.test(name) || type.includes('int64')) {
+                    this.secInputName = name;
+                } else if (/macro|regime/i.test(name)) {
+                    this.macroInputName = name;
+                    if (dims.length === 2 && typeof dims[1] === 'number') this.macroDim = dims[1];
+                    else if (dims.length === 1 && typeof dims[0] === 'number') this.macroDim = dims[0];
+                }
             }
 
-            console.log(`[StockPredictor] Successfully loaded V11 Factor Engine: ${this.modelPath}`);
-            console.log(`[StockPredictor] Inputs: [${this.inputNames.join(', ')}] | Outputs: [${this.outputNames.join(', ')}]`);
-            console.log(`[StockPredictor] Mask Topology: ${this.maskIsBoolean ? 'BOOLEAN' : 'FLOAT32'}`);
+            if (!this.xInputName && this.inputNames.length > 0) this.xInputName = this.inputNames[0];
+            if (!this.maskInputName && this.inputNames.length > 1) this.maskInputName = this.inputNames[1];
+            if (!this.secInputName && this.inputNames.length > 2) this.secInputName = this.inputNames[2];
+
+            console.log(`[StockPredictor] Loaded MS-iTransformer Model: ${this.modelPath}`);
+            console.log(`[StockPredictor] Bindings: X='${this.xInputName}', Mask='${this.maskInputName}' (${this.maskIsBoolean ? 'BOOL' : 'FLOAT'}), Sector='${this.secInputName}', Macro='${this.macroInputName || 'None'}'`);
         }
         return this;
     }
 
-    _applyCrossSectionalRanking(activeSequences, N) {
-        if (N <= 1) return;
-        const denom = (N - 1.0 + 1e-6);
+    async predict(activeTickers, activeSequences, stockVolsMap) {
+        if (!this.session) throw new Error("[StockPredictor] Engine not initialized.");
 
-        for (let t = 0; t < LOOKBACK; t++) {
-            const tOffset = t * NUM_FEATURES;
-
-            for (let f = 0; f < NUM_FEATURES; f++) {
-                const featureIdx = tOffset + f;
-                const sortable = new Array(N);
-
-                for (let s = 0; s < N; s++) {
-                    const v = activeSequences[s][featureIdx];
-                    sortable[s] = { val: Number.isFinite(v) ? v : 0.0, stockIdx: s };
-                }
-
-                sortable.sort((a, b) => a.val - b.val);
-
-                let r = 0;
-                while (r < N) {
-                    let j = r;
-                    while (j + 1 < N && Math.abs(sortable[j + 1].val - sortable[r].val) < 1e-12) {
-                        j++;
-                    }
-                    const avgRank = (r + j) / 2.0;
-                    const normRank = (avgRank / denom) - 0.5;
-
-                    for (let k = r; k <= j; k++) {
-                        activeSequences[sortable[k].stockIdx][featureIdx] = normRank;
-                    }
-                    r = j + 1;
-                }
-            }
-        }
-    }
-
-    async rankStocks(activeTickers, activeSequences, macroVector, stockVolsMap, topK = DEFAULT_TOP_K, needsRanking = true) {
-        if (!this.session) {
-            throw new Error("[StockPredictor] Engine uninitialized. Call init() first.");
-        }
-
-        const activeCount = Math.min(activeTickers.length, MAX_STOCKS);
+        const activeCount = Math.min(activeTickers.length, this.modelMaxStocks);
         if (activeCount === 0) return [];
 
         const tickersSlice = activeTickers.slice(0, activeCount);
         const seqSlice = activeSequences.slice(0, activeCount);
 
-        if (needsRanking) {
-            this._applyCrossSectionalRanking(seqSlice, activeCount);
+        // 1. Compute Macro Vector BEFORE rank-scaling
+        const lastStep = (this.modelSeqLen - 1) * NUM_FEATURES;
+        const retList = [];
+        const hlList = [];
+        const normVolList = [];
+
+        for (let s = 0; s < activeCount; s++) {
+            retList.push(seqSlice[s][lastStep + 0]);
+            hlList.push(seqSlice[s][lastStep + 11]);
+            normVolList.push(seqSlice[s][lastStep + 10]);
         }
 
-        const xBuffer = new Float32Array(1 * MAX_STOCKS * LOOKBACK * NUM_FEATURES);
-        const macroBuffer = new Float32Array(1 * MACRO_DIM);
-        macroBuffer.set(macroVector);
+        const nAct = retList.length;
+        let meanRet = 0.0, meanHL = 0.0, meanNormVol = 0.0, dispersion = 0.0;
+        if (nAct > 0) {
+            meanRet = retList.reduce((a, b) => a + b, 0.0) / nAct;
+            meanHL = hlList.reduce((a, b) => a + b, 0.0) / nAct;
+            meanNormVol = normVolList.reduce((a, b) => a + b, 0.0) / nAct;
+            const varRet = retList.reduce((a, b) => a + (b - meanRet) ** 2, 0.0) / Math.max(1, nAct - 1);
+            dispersion = Math.sqrt(Math.max(varRet, 0.0));
+        }
+        const macroVector = [dispersion, meanRet, meanHL, meanNormVol];
 
-        const maskBufferBool = new Uint8Array(MAX_STOCKS);
-        const maskBufferFloat = new Float32Array(MAX_STOCKS);
-        const sectorBuffer = new BigInt64Array(MAX_STOCKS);
+        // 2. Cross-Sectional Percentile Normalization [-1, 1]
+        applyCrossSectionalRankScaling(seqSlice, activeCount, this.modelSeqLen);
+
+        const targetN = this.modelMaxStocks;
+        const xBuffer = new Float32Array(1 * targetN * this.modelSeqLen * NUM_FEATURES);
+        const maskBufferBool = new Uint8Array(1 * targetN);
+        const maskBufferFloat = new Float32Array(1 * targetN);
+        const sectorBuffer = new BigInt64Array(1 * targetN);
 
         for (let s = 0; s < activeCount; s++) {
             maskBufferBool[s] = 1;
             maskBufferFloat[s] = 1.0;
 
             const ticker = tickersSlice[s];
-            const secName = TICKER_GICS_SECTORS[ticker] || 'Unknown';
-            const secId = SECTOR_TO_ID[secName] || 0;
-            sectorBuffer[s] = BigInt(secId);
+            const rawSec = TICKER_GICS_SECTORS[ticker] || 'General';
+            const cleanSec = GICS_CLEAN_MAP[rawSec] || 'General';
+            sectorBuffer[s] = BigInt(SECTOR_TO_ID[cleanSec] ?? 0);
 
-            const seq = seqSlice[s];
-            const stockOffset = s * (LOOKBACK * NUM_FEATURES);
-            xBuffer.set(seq, stockOffset);
+            const offset = s * (this.modelSeqLen * NUM_FEATURES);
+            xBuffer.set(seqSlice[s], offset);
         }
 
-        // Collision-proof dynamic input binding
-        const maskName = this.inputNames.find(n => /mask/i.test(n)) || this.inputNames[2] || 'stock_mask';
-        const macroName = this.inputNames.find(n => /macro/i.test(n)) || this.inputNames[1] || 'macro_regime';
-        const secName = this.inputNames.find(n => /(sec|sector)/i.test(n)) || this.inputNames[3] || 'sector_ids';
-        const xName = this.inputNames.find(n => !/mask/i.test(n) && !/macro/i.test(n) && !/(sec|sector)/i.test(n)) || this.inputNames[0] || 'x_features';
-
         const feeds = {
-            [xName]: new ort.Tensor('float32', xBuffer, [1, MAX_STOCKS, LOOKBACK, NUM_FEATURES]),
-            [macroName]: new ort.Tensor('float32', macroBuffer, [1, MACRO_DIM]),
-            [maskName]: this.maskIsBoolean
-                ? new ort.Tensor('bool', maskBufferBool, [1, MAX_STOCKS])
-                : new ort.Tensor('float32', maskBufferFloat, [1, MAX_STOCKS])
+            [this.xInputName]: new ort.Tensor('float32', xBuffer, [1, targetN, this.modelSeqLen, NUM_FEATURES]),
+            [this.maskInputName]: this.maskIsBoolean
+                ? new ort.Tensor('bool', maskBufferBool, [1, targetN])
+                : new ort.Tensor('float32', maskBufferFloat, [1, targetN])
         };
 
-        if (this.inputNames.includes(secName) || this.inputNames.length >= 4) {
-            feeds[secName] = new ort.Tensor('int64', sectorBuffer, [1, MAX_STOCKS]);
+        if (this.secInputName) feeds[this.secInputName] = new ort.Tensor('int64', sectorBuffer, [1, targetN]);
+
+        if (this.macroInputName) {
+            const macroBuffer = new Float32Array(this.macroDim);
+            for (let i = 0; i < Math.min(macroVector.length, this.macroDim); i++) {
+                macroBuffer[i] = macroVector[i];
+            }
+            const macroMeta = this.session.inputMetadata?.[this.macroInputName];
+            const macroShape = macroMeta?.dimensions?.length === 1 ? [this.macroDim] : [1, this.macroDim];
+            feeds[this.macroInputName] = new ort.Tensor('float32', macroBuffer, macroShape);
+        }
+
+        // Safety fallback for any unmapped inputs
+        for (const inputName of this.inputNames) {
+            if (!feeds[inputName]) {
+                const meta = this.session.inputMetadata?.[inputName];
+                const type = String(meta?.type || 'float32').toLowerCase();
+                const dims = meta?.dimensions || [1];
+                const resolvedDims = dims.map(d => (typeof d === 'number' && d > 0 ? d : 1));
+                const totalElements = resolvedDims.reduce((a, b) => a * b, 1);
+
+                if (type.includes('bool')) {
+                    feeds[inputName] = new ort.Tensor('bool', new Uint8Array(totalElements).fill(1), resolvedDims);
+                } else if (type.includes('int64')) {
+                    feeds[inputName] = new ort.Tensor('int64', new BigInt64Array(totalElements), resolvedDims);
+                } else {
+                    feeds[inputName] = new ort.Tensor('float32', new Float32Array(totalElements), resolvedDims);
+                }
+            }
         }
 
         let results;
         try {
             results = await this.session.run(feeds);
-        } catch (runErr) {
+        } catch (err) {
             this.maskIsBoolean = !this.maskIsBoolean;
-            feeds[maskName] = this.maskIsBoolean
-                ? new ort.Tensor('bool', maskBufferBool, [1, MAX_STOCKS])
-                : new ort.Tensor('float32', maskBufferFloat, [1, MAX_STOCKS]);
+            feeds[this.maskInputName] = this.maskIsBoolean
+                ? new ort.Tensor('bool', maskBufferBool, [1, targetN])
+                : new ort.Tensor('float32', maskBufferFloat, [1, targetN]);
             results = await this.session.run(feeds);
         }
 
@@ -1187,248 +756,232 @@ class StockPredictor {
             return k ? results[k].data : null;
         };
 
-        const alpha5Data = getOutputData(/(alpha_?5|^alpha$)/i);
-        const predTotal5Data = getOutputData(/pred_total_?5/i);
-        const alpha1Data = getOutputData(/alpha_?1/i);
-        const alpha3Data = getOutputData(/alpha_?3/i);
-        const systematicData = getOutputData(/systematic_return_?5/i);
-
-        const rawAlphaArr = new Float32Array(activeCount);
-        const rawAlpha1Arr = new Float32Array(activeCount);
-        const rawAlpha3Arr = new Float32Array(activeCount);
-        const rawSysArr = new Float32Array(activeCount);
-
-        for (let s = 0; s < activeCount; s++) {
-            if (alpha5Data) {
-                rawAlphaArr[s] = Number(alpha5Data[s]);
-            } else if (predTotal5Data) {
-                rawAlphaArr[s] = Number(predTotal5Data[s]);
-            }
-
-            if (alpha1Data) rawAlpha1Arr[s] = Number(alpha1Data[s]);
-            if (alpha3Data) rawAlpha3Arr[s] = Number(alpha3Data[s]);
-            if (systematicData) rawSysArr[s] = Number(systematicData[s]);
-        }
+        const rawOutput = getOutputData(/(alpha_?5|target_alpha|^alpha$|pred_total_?5|^output$)/i)
+            || results[this.outputNames[0]]?.data
+            || results[Object.keys(results)[0]]?.data;
 
         // ======================================================================
-        // NON-PARAMETRIC SYMMETRIC RANK-QUANTILE CALIBRATION
-        // Guarantees exact balance between Longs (+3.5%) and Shorts (-3.5%)
+        // NON-PARAMETRIC SYMMETRIC RANK CALIBRATION
+        // Binds raw IC logit scores to realistic alpha returns:
+        // Top longs fan up to +3.5%, worst shorts down to -3.5%
         // ======================================================================
         const order = Array.from({ length: activeCount }, (_, i) => i);
-        order.sort((a, b) => rawAlphaArr[a] - rawAlphaArr[b]); // Ascending order
+        order.sort((a, b) => Number(rawOutput[a]) - Number(rawOutput[b]));
 
         const symmetricZ = new Float32Array(activeCount);
         for (let rank = 0; rank < activeCount; rank++) {
             const stockIdx = order[rank];
-            const uniformP = (rank / (activeCount - 1 || 1)) * 2.0 - 1.0; 
+            const uniformP = (rank / Math.max(1, activeCount - 1)) * 2.0 - 1.0; 
             symmetricZ[stockIdx] = Math.sign(uniformP) * Math.pow(Math.abs(uniformP), 0.85) * 3.0;
         }
 
-        const scoredPicks = [];
-
+        const scored = [];
         for (let s = 0; s < activeCount; s++) {
             const ticker = tickersSlice[s];
-            const vol5d = stockVolsMap.get(ticker) || 2.50;
-
             const zAlpha = symmetricZ[s];
-            const convictionScore = Number((zAlpha * 0.10).toFixed(4));
+            const rawLogit = Number(rawOutput[s]);
+            const realizedVol = stockVolsMap.get(ticker) || 0.015;
 
-            // Longs fan up to +3.5%; Shorts fan down to -3.5%!
-            const alphaContribution = (zAlpha / 3.0) * (vol5d * 0.50);
+            // 5-day annualized volatility floor/ceiling
+            const vol5d = Math.max(1.20, Math.min(7.50, realizedVol * Math.sqrt(5.0) * 100.0));
+
+            // Alpha return bound: Z=+3.0 yields between +2.5% and +3.8%
+            const alphaContribution = (zAlpha / 3.0) * (vol5d * 0.45);
             const expectedReturn5d = Number(alphaContribution.toFixed(2));
-
-            const cdfProb = normalCDF(zAlpha);
-            const directionConfidence = Number((cdfProb * 100.0).toFixed(2));
-
-            let direction = 'Neutral';
-            if (zAlpha > 0.45) {
-                direction = 'Bullish';
-            } else if (zAlpha < -0.45) {
-                direction = 'Bearish';
-            }
-
             const uncertainty5d = Number(vol5d.toFixed(2));
 
-            const a1 = Number(rawAlpha1Arr[s]) || (expectedReturn5d * 0.20);
-            const a3 = Number(rawAlpha3Arr[s]) || (expectedReturn5d * 0.60);
+            // Normalized SNR bounded between -3.0 and +3.0
+            const snr = Number((zAlpha * 0.45).toFixed(3));
+            const directionConfidence = Number((normalCDF(zAlpha) * 100.0).toFixed(1));
+
+            let direction = 'Neutral';
+            if (zAlpha > 0.40) direction = 'Bullish';
+            else if (zAlpha < -0.40) direction = 'Bearish';
 
             const horizons = {
-                d1: { return: Number((a1 * 100.0).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(1 / 5)).toFixed(2)) },
-                d2: { return: Number(((a1 + a3) * 50.0).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(2 / 5)).toFixed(2)) },
-                d3: { return: Number((a3 * 100.0).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(3 / 5)).toFixed(2)) },
-                d4: { return: Number(((a3 * 100.0) + (expectedReturn5d - (a3 * 100.0)) * 0.5).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(4 / 5)).toFixed(2)) },
+                d1: { return: Number((expectedReturn5d * 0.20).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(1 / 5)).toFixed(2)) },
+                d2: { return: Number((expectedReturn5d * 0.40).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(2 / 5)).toFixed(2)) },
+                d3: { return: Number((expectedReturn5d * 0.60).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(3 / 5)).toFixed(2)) },
+                d4: { return: Number((expectedReturn5d * 0.80).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(4 / 5)).toFixed(2)) },
                 d5: { return: expectedReturn5d, uncertainty: uncertainty5d }
             };
 
-            scoredPicks.push({
+            scored.push({
                 ticker,
-                sector: TICKER_GICS_SECTORS[ticker] || 'Unknown',
-                score: convictionScore,
-                alpha: Number(zAlpha.toFixed(4)),
-                rawAlpha: Number(rawAlphaArr[s].toFixed(5)),
-                compositeAlpha: convictionScore,
+                sector: TICKER_GICS_SECTORS[ticker] || 'General',
+                rawAlpha: Number(rawLogit.toFixed(4)),
+                alpha: Number((expectedReturn5d / 100.0).toFixed(4)),
+                snr,
                 expectedReturn5d,
                 uncertainty5d,
+                realizedVol,
                 direction,
                 directionConfidence,
                 horizons
             });
         }
 
-        // Descending sort: Rank #1 = Best Long, Rank #503 = Worst Short
-        scoredPicks.sort((a, b) => b.alpha - a.alpha);
+        // Descending sort: highest conviction Long (#1) to lowest
+        scored.sort((a, b) => b.expectedReturn5d - a.expectedReturn5d);
 
-        return scoredPicks.map((item, idx) => ({
-            rank: idx + 1,
-            ...item
-        }));
+        return {
+            ranked: scored.map((item, idx) => ({ rank: idx + 1, ...item })),
+            macroVector
+        };
     }
 }
 
 // ==============================================================================
-// SECTION 6: UNIFIED ORCHESTRATOR & CONVEX ALLOCATION ENGINE (K=15, p=2.5)
+// SECTION 7: PIPELINE ORCHESTRATOR & DYNAMIC RISK-PARITY SIZING
 // ==============================================================================
-
 async function buildAndRunPredictor(options = {}) {
     const t0 = Date.now();
-    const modelPath = options.modelPath || path.join(__dirname, 'Ocean.onnx');
-    const targetK = options.topK || DEFAULT_TOP_K; // K=15
+    const predictor = new StockPredictor(options.modelPath);
+    await predictor.init();
 
+    const targetK = options.topK || DEFAULT_TOP_K;
     const activeUniverse = SP500_TICKERS.filter(t => !DEAD_TICKERS.has(t));
-    console.log(`[InferencePipeline] Preparing point-in-time factor matrices for ${activeUniverse.length} S&P 500 instruments...`);
+    const lookback = predictor.modelSeqLen;
 
-    const { targetDates, stockDataMap, stockVolsMap, stockPricesMap, macroVector, spyMom20 } = await prepareInferenceInputs(
-        activeUniverse,
-        LOOKBACK,
-        options
-    );
+    console.log(`[Predictor Pipeline] Downloading OHLCV for ${activeUniverse.length} equities (Window: ${lookback} sessions)...`);
+
+    const benchSeries = await getOHLCV(BENCHMARK_TICKER, STOCK_RANGE_DAYS, options.cacheDir);
+    if (!benchSeries || benchSeries.closes.length < lookback + 50) {
+        throw new Error(`[Predictor Pipeline] Unable to ingest benchmark session dates for ${BENCHMARK_TICKER}`);
+    }
+
+    const targetDates = benchSeries.dates.slice(-lookback);
+    const signalDate = targetDates[targetDates.length - 1];
+    const isMonday = new Date(signalDate).getUTCDay() === 1;
+
+    const rawSeriesMap = await fetchManyOHLCV(activeUniverse, STOCK_RANGE_DAYS, options.cacheDir);
 
     const activeTickers = [];
     const activeSequences = [];
+    const stockVolsMap = new Map();
+    const stockPricesMap = new Map();
 
-    for (const [ticker, seq] of stockDataMap.entries()) {
-        activeTickers.push(ticker);
-        activeSequences.push(new Float32Array(seq));
-    }
+    for (const sym of activeUniverse) {
+        const series = rawSeriesMap.get(sym);
+        if (!series) continue;
 
-    if (activeTickers.length < 30) {
-        throw new Error(`[InferencePipeline] Insufficient active instruments for inference: ${activeTickers.length}`);
-    }
+        const processed = computeRawSignals(series);
+        if (!processed) continue;
 
-    console.log(`[InferencePipeline] Executing V11 Forward Pass across ${activeTickers.length} instruments (SPY 20d Mom: ${(spyMom20 * 100).toFixed(2)}%)...`);
+        const { dateFeatureMap, realizedVol, lastClose } = processed;
+        if (!dateFeatureMap.has(signalDate)) continue;
 
-    const predictor = new StockPredictor(modelPath);
-    await predictor.init();
+        const seq = new Float32Array(lookback * NUM_FEATURES);
+        let missing = 0, lastValid = null;
 
-    const ranked = await predictor.rankStocks(
-        activeTickers,
-        activeSequences,
-        macroVector,
-        stockVolsMap,
-        activeTickers.length,
-        true
-    );
+        for (let t = 0; t < lookback; t++) {
+            const dt = targetDates[t];
+            let row = dateFeatureMap.get(dt);
+            if (!row) {
+                missing++;
+                row = lastValid || new Float32Array(NUM_FEATURES);
+            } else {
+                lastValid = row;
+            }
+            seq.set(row, t * NUM_FEATURES);
+        }
 
-    const predictions = ranked.map(item => ({
-        ticker: item.ticker,
-        sector: item.sector,
-        price: stockPricesMap.get(item.ticker) || null,
-        snr: item.score,
-        expectedReturn5d: item.expectedReturn5d,
-        uncertainty5d: item.uncertainty5d,
-        direction: item.direction,
-        directionConfidence: item.directionConfidence,
-        alpha: item.alpha,
-        rawAlpha: item.rawAlpha,
-        compositeAlpha: item.compositeAlpha,
-        rank: item.rank,
-        group: 'Neutral',
-        portfolioWeight: 0.0,
-        horizons: item.horizons
-    }));
-
-    const finalTopK = Math.min(targetK, predictions.length);
-
-    // Assign Decile Groups
-    for (let idx = 0; idx < predictions.length; idx++) {
-        if (idx < finalTopK) {
-            predictions[idx].group = 'Top Long';
-        } else if (idx >= predictions.length - finalTopK) {
-            predictions[idx].group = 'Top Short';
-        } else {
-            predictions[idx].group = 'Neutral';
+        if (missing <= 3 && lastValid !== null) {
+            activeTickers.push(sym);
+            activeSequences.push(seq);
+            stockVolsMap.set(sym, realizedVol);
+            stockPricesMap.set(sym, lastClose);
         }
     }
 
-    // ==========================================================================
-    // CONVEX POWER-LAW ALLOCATION ENGINE (K=15, p=2.5) + DYNAMIC CASH SWITCH
-    // ==========================================================================
-    const powerWeights = new Float32Array(finalTopK);
-    let sumPower = 0.0;
-    for (let i = 0; i < finalTopK; i++) {
-        const w = Math.pow(finalTopK - i, POWER_DECAY_P);
-        powerWeights[i] = w;
-        sumPower += w;
-    }
+    console.log(`[Predictor Pipeline] Running MS-iTransformer forward pass across ${activeTickers.length} instruments...`);
 
-    // Dynamic Macro Volatility & Trend Cash Switch
-    let portfolioExposure = 1.00;
-    if (spyMom20 < MACRO_CASH_TRIGGER) {
-        portfolioExposure = DEFENSIVE_EXPOSURE;
-        console.log(`[RiskEngine] Macro Cash Switch Engaged: SPY 20d (${(spyMom20 * 100).toFixed(2)}%) < ${(MACRO_CASH_TRIGGER * 100).toFixed(1)}%. Exposure throttled to ${(portfolioExposure * 100).toFixed(0)}%.`);
-    }
+    const { ranked, macroVector } = await predictor.predict(activeTickers, activeSequences, stockVolsMap);
+    const finalTopK = Math.min(targetK, ranked.length);
 
-    for (let i = 0; i < finalTopK; i++) {
-        const baseWeight = powerWeights[i] / (sumPower || 1.0);
-        predictions[i].portfolioWeight = Number((baseWeight * portfolioExposure).toFixed(4));
-    }
+    // Dynamic Conviction Capital Sizing
+    const topMeanRet = ranked.slice(0, finalTopK).reduce((acc, p) => acc + p.expectedReturn5d, 0) / finalTopK;
+    const botMeanRet = ranked.slice(-finalTopK).reduce((acc, p) => acc + p.expectedReturn5d, 0) / finalTopK;
+    const modelSpread = (topMeanRet - botMeanRet) / 100.0;
 
-    const topSlice = predictions.slice(0, finalTopK);
-    const botSlice = predictions.slice(-finalTopK);
-    const topMean = topSlice.reduce((acc, p) => acc + p.snr, 0) / (finalTopK || 1);
-    const botMean = botSlice.reduce((acc, p) => acc + p.snr, 0) / (finalTopK || 1);
-    const marketSpread = Number((topMean - botMean).toFixed(4));
+    const spreadRange = HIGH_CONVICTION_SPREAD - LOW_CONVICTION_SPREAD;
+    const convictionPct = (modelSpread - LOW_CONVICTION_SPREAD) / (spreadRange + 1e-8);
+    const capitalExposure = Math.max(MIN_CAPITAL_EXPOSURE, Math.min(MAX_CAPITAL_EXPOSURE, MIN_CAPITAL_EXPOSURE + convictionPct * (MAX_CAPITAL_EXPOSURE - MIN_CAPITAL_EXPOSURE)));
+
+    const effectiveHurdle = (CONVICTION_THRESHOLD * (isMonday ? MONDAY_HURDLE_MULT : 1.0)) * 100.0;
+
+    const topLongs = ranked.slice(0, finalTopK);
+    const invVols = topLongs.map(p => 1.0 / p.realizedVol);
+    const invVolSum = invVols.reduce((a, b) => a + b, 0.0) || 1.0;
+
+    const predictions = ranked.map((item, idx) => {
+        let group = 'Neutral';
+        let portfolioWeight = 0.0;
+
+        if (idx < finalTopK) {
+            group = 'Top Long';
+            if (item.expectedReturn5d >= effectiveHurdle) {
+                const normWeight = (1.0 / item.realizedVol) / invVolSum;
+                portfolioWeight = Number((normWeight * capitalExposure).toFixed(4));
+            }
+        } else if (idx >= ranked.length - finalTopK) {
+            group = 'Top Short';
+        }
+
+        return {
+            ticker: item.ticker,
+            sector: item.sector,
+            price: stockPricesMap.get(item.ticker) || null,
+            rank: item.rank,
+            group,
+            portfolioWeight,
+            rawAlpha: item.rawAlpha,
+            alpha: item.alpha,
+            expectedReturn5d: item.expectedReturn5d,
+            uncertainty5d: item.uncertainty5d,
+            snr: item.snr,
+            direction: item.direction,
+            directionConfidence: item.directionConfidence,
+            horizons: item.horizons
+        };
+    });
 
     return {
         predictions,
         universeSize: predictions.length,
-        marketSpread,
+        marketSpread: Number(modelSpread.toFixed(4)),
         topK: finalTopK,
         macroState: {
+            signalDate,
+            weekday: new Date(signalDate).toLocaleDateString('en-US', { weekday: 'long' }),
             dispersion: Number(macroVector[0].toFixed(4)),
             meanReturn: Number(macroVector[1].toFixed(4)),
             meanHLSpread: Number(macroVector[2].toFixed(4)),
             meanNormVol: Number(macroVector[3].toFixed(4)),
-            spyMom20: Number((spyMom20 * 100).toFixed(2)),
-            cashAllocationPct: Number(((1.0 - portfolioExposure) * 100).toFixed(1)),
-            equityExposurePct: Number((portfolioExposure * 100).toFixed(1))
+            isMondayHurdleActive: isMonday,
+            effectiveConvictionHurdle: Number(effectiveHurdle.toFixed(3)),
+            topMeanReturnPct: Number(topMeanRet.toFixed(2)),
+            bottomMeanReturnPct: Number(botMeanRet.toFixed(2)),
+            modelSpreadPct: Number((modelSpread * 100).toFixed(2)),
+            equityExposurePct: Number((capitalExposure * 100).toFixed(1)),
+            cashPreservationPct: Number(((1.0 - capitalExposure) * 100).toFixed(1))
         },
         executionModel: {
-            strategy: 'Production V11 Architecture (Convex Power-Decay + Macro Cash Switch)',
-            targetBreadthK: finalTopK,
-            powerDecayExponent: POWER_DECAY_P,
-            rebalanceHorizon: 5,
-            entryProtocol: 'Market Open(t+1)',
-            exitProtocol: 'Market Open(t+6)',
-            executionFrictionBps: Number((DEFAULT_EXECUTION_FRICTION * 10000).toFixed(0)),
-            distressHaircutRule: '-50% Terminal Liquidation Penalty',
-            auditedSharpeNominal: 3.38,
-            auditedSharpeHaircut: 2.54,
-            auditedInformationRatio: 3.11,
-            auditedSortinoRatio: 7.52,
-            auditedMaxDrawdown: '-28.68%',
-            auditedCumulativeReturn: '+584.40%'
+            architecture: '3D Hierarchical MS-iTransformer (1 Market + 11 GICS Sectors)',
+            portfolioSizing: 'Inverse-Volatility Risk Parity (w_i ~ 1/vol)',
+            rebalanceHorizon: '5-Day Forward Alpha Horizon',
+            feeDragModel: `${(TRANSACTION_FEE_BPS * 10000).toFixed(0)} bps per rebalance`,
+            minHoldingPeriod: '3 Days'
         },
-        signalDate: targetDates[targetDates.length - 1],
+        signalDate,
         latency: Date.now() - t0,
         timestamp: new Date().toISOString()
     };
 }
 
 // ==============================================================================
-// SECTION 7: WORKER THREAD MANAGER
+// SECTION 8: WORKER THREAD MANAGER & MULTI-THREAD EXPORTS
 // ==============================================================================
-
 function createManager() {
     let worker = null;
     let workerReady = null;
@@ -1473,12 +1026,8 @@ function createManager() {
         });
 
         w.on('exit', (code) => {
-            if (code !== 0) {
-                console.error(`[InferenceWorker] Exited with code ${code}`);
-            }
-            for (const [, entry] of pending) {
-                entry.reject(new Error(`InferenceWorker exited with code ${code}`));
-            }
+            if (code !== 0) console.error(`[InferenceWorker] Exited with code ${code}`);
+            for (const [, entry] of pending) entry.reject(new Error(`Worker exited with code ${code}`));
             pending.clear();
             worker = null;
             workerReady = null;
@@ -1488,20 +1037,16 @@ function createManager() {
     }
 
     function getWorker() {
-        if (!worker) {
-            worker = spawnWorker();
-        }
+        if (!worker) worker = spawnWorker();
         return worker;
     }
 
     async function runInference(options = {}) {
         if (inflightRun) return inflightRun;
-
         const w = getWorker();
         await workerReady;
 
         const requestId = ++requestCounter;
-
         inflightRun = new Promise((resolve, reject) => {
             pending.set(requestId, { resolve, reject });
             w.postMessage({ type: 'run', requestId, options });
@@ -1520,12 +1065,10 @@ function createManager() {
 }
 
 // ==============================================================================
-// SECTION 8: ENTRYPOINT & MODULE EXPORTS
+// SECTION 9: ENTRYPOINT & MODULE EXPORTS
 // ==============================================================================
 if (parentPort || workerData?.mode === 'worker') {
-    if (!parentPort) {
-        throw new Error('[AI Stock Predictor Worker] Requires valid parentPort context.');
-    }
+    if (!parentPort) throw new Error('[AI Stock Predictor Worker] Requires valid parentPort context.');
 
     parentPort.on('message', async (msg) => {
         if (!msg || msg.type !== 'run') return;
@@ -1548,23 +1091,15 @@ if (parentPort || workerData?.mode === 'worker') {
         runInference: manager.runInference,
         getLatestPredictions: manager.getLatestPredictions,
         buildAndRunPredictor,
-        prepareInferenceInputs,
-        computeStationaryFactors,
+        computeRawSignals,
+        applyCrossSectionalRankScaling,
         getOHLCV,
-        rollingMean,
-        sigmoid,
-        normalCDF,
         StockPredictor,
         SP500_TICKERS,
         DEAD_TICKERS,
         FEATURE_NAMES,
-        SECTORS_LIST,
         SECTOR_TO_ID,
         TICKER_GICS_SECTORS,
-        LOOKBACK,
-        MAX_STOCKS,
-        NUM_FACTORS,
-        DEFAULT_TOP_K,
-        POWER_DECAY_P
+        DEFAULT_TOP_K
     };
 }
