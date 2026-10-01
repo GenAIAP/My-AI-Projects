@@ -224,9 +224,11 @@
     </form>
   </div>
 
+  <script src="/presence.js"></script>
   <script src="/socket.io/socket.io.js"></script>
   <script>
-    const socket = io();
+    const socket = io(window.presenceSocketOptions());
+    window.watchForPresenceBans(socket);
     const statusBadge = document.getElementById('statusBadge');
     const statusText = document.getElementById('statusText');
     const socketIdSpan = document.getElementById('socketId');
