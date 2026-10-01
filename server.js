@@ -24,6 +24,7 @@ const panelCookieNames = { admin: 'admin_session', moderator: 'moderator_session
 const adminSessionDuration = 8 * 60 * 60 * 1000;
 const adminBanStorePath = path.join(__dirname, '.admin-bans.json');
 const activeBans = new Map();
+const knownAdminAddresses = new Map();
 const adminUserNames = new Set(
     adminCredentials && typeof adminCredentials === 'object' && !Array.isArray(adminCredentials)
         ? Object.keys(adminCredentials).map(name => name.toLowerCase())
@@ -68,6 +69,34 @@ function getSocketAddress(socket) {
     return normalizeAddress(address);
 }
 
+function getPresenceClientId(req) {
+    const cookieHeader = req.headers.cookie || '';
+    const cookie = cookieHeader.split(';').map(value => value.trim())
+        .find(value => value.startsWith('site_presence_client_id='));
+    if (!cookie) return null;
+
+    try {
+        const clientId = decodeURIComponent(cookie.slice('site_presence_client_id='.length));
+        return clientId && clientId.length <= 100 ? clientId : null;
+    } catch {
+        return null;
+    }
+}
+
+function getSocketBanIdentity(socket) {
+    if (socket.data.panelRole) return `panel:${socket.data.panelRole}:${socket.data.panelUsername}`;
+    if (socket.data.clientId) return `client:${socket.data.clientId}`;
+    return `address:${getSocketAddress(socket)}`;
+}
+
+function getRequestBanIdentity(req, site, address) {
+    const panelRole = site === '/admin' || site === '/moderator' ? site.slice(1) : null;
+    const panelSession = panelRole ? getPanelSession(req, panelRole, true) : null;
+    if (panelSession) return `panel:${panelRole}:${panelSession.username}`;
+    const clientId = getPresenceClientId(req);
+    return clientId ? `client:${clientId}` : `address:${address}`;
+}
+
 function normalizeAddress(address) {
     return address?.startsWith('::ffff:') ? address.slice(7) : address;
 }
@@ -94,19 +123,40 @@ function getBanExpiry(address) {
     return expiresAt;
 }
 
-function getBannedSites(address) {
-    if (getBanExpiry(address)) return adminSites.map(site => site.path);
-    return adminSites
-        .map(site => site.path)
-        .filter(site => getBanExpiry(getSiteBanKey(address, site)));
+function getEffectiveBanExpiry(identity, address, site, ignoreAddressBan = false) {
+    const keys = [identity];
+    if (site) keys.push(getSiteBanKey(identity, site));
+    if (!ignoreAddressBan && address) {
+        keys.push(address);
+        if (site) keys.push(getSiteBanKey(address, site));
+    }
+    for (const key of keys) {
+        const expiresAt = getBanExpiry(key);
+        if (expiresAt) return expiresAt;
+    }
+    return null;
 }
 
-function getSiteBanExpiries(address) {
-    const globalExpiry = getBanExpiry(address);
-    return Object.fromEntries(adminSites.flatMap(site => {
-        const expiresAt = globalExpiry || getBanExpiry(getSiteBanKey(address, site.path));
+function isKnownAdminAddress(address) {
+    const expiresAt = knownAdminAddresses.get(address);
+    if (!expiresAt) return false;
+    if (expiresAt <= Date.now()) {
+        knownAdminAddresses.delete(address);
+        return false;
+    }
+    return true;
+}
+
+function getBanStatus(identity) {
+    const globalExpiry = getBanExpiry(identity);
+    const siteBanExpiries = Object.fromEntries(adminSites.flatMap(site => {
+        const expiresAt = globalExpiry || getBanExpiry(getSiteBanKey(identity, site.path));
         return expiresAt ? [[site.path, expiresAt]] : [];
     }));
+    return {
+        bannedSites: Object.keys(siteBanExpiries),
+        siteBanExpiries
+    };
 }
 
 function getRequestedSite(req) {
@@ -125,7 +175,9 @@ app.use((req, res, next) => {
     if (!site) return next();
 
     const address = normalizeAddress(req.socket.remoteAddress);
-    const expiresAt = getBanExpiry(address) || getBanExpiry(getSiteBanKey(address, site));
+    const identity = getRequestBanIdentity(req, site, address);
+    const authenticatedAdmin = getPanelSession(req, 'admin', true);
+    const expiresAt = getEffectiveBanExpiry(identity, address, site, Boolean(authenticatedAdmin));
     if (!expiresAt) return next();
     const remainingSeconds = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
 
@@ -199,7 +251,7 @@ function createPanelSession(username, role, expiresAt = Date.now() + adminSessio
     return `${payload}.${signature}`;
 }
 
-function getPanelSession(req, role) {
+function getPanelSession(req, role, allowBanned = false) {
     const cookieHeader = req.headers.cookie || '';
     const cookie = cookieHeader.split(';').map(value => value.trim())
         .find(value => value.startsWith(`${panelCookieNames[role]}=`));
@@ -228,8 +280,10 @@ function getPanelSession(req, role) {
             (session.role !== role && !(role === 'admin' && !session.role)) ||
             !Object.hasOwn(credentials, session.username)) return null;
         const address = normalizeAddress(req.socket?.remoteAddress);
-        if (role === 'moderator' && address &&
-            (getBanExpiry(address) || getBanExpiry(getSiteBanKey(address, '/moderator')))) return null;
+        if (role === 'admin' && address) knownAdminAddresses.set(address, session.expiresAt);
+        const identity = `panel:${role}:${session.username}`;
+        if (!allowBanned && role === 'moderator' && address &&
+            getEffectiveBanExpiry(identity, address, '/moderator')) return null;
         return session;
     } catch {
         return null;
@@ -272,13 +326,6 @@ function getPanelUserSockets(userId) {
     );
 }
 
-function getModeratorBlockedAddresses() {
-    return new Set([...io.sockets.sockets.values()]
-        .filter(isAdminSocket)
-        .map(getSocketAddress)
-        .filter(Boolean));
-}
-
 function handlePanelUsers(req, res, role) {
     if (!getPanelSession(req, role)) return res.status(403).json({ error: 'Access denied' });
     const groups = new Map();
@@ -288,18 +335,18 @@ function handlePanelUsers(req, res, role) {
         groups.get(id).push(socket);
     }
 
-    const protectedAddresses = getModeratorBlockedAddresses();
     const users = [...groups].map(([id, sockets]) => {
         sockets.sort((left, right) => right.data.connectedAt.localeCompare(left.data.connectedAt));
         const name = sockets.map(socket => normalizeName(socket.data.name)).find(value => value !== 'Guest') || 'Guest';
         const panelSocket = sockets.find(socket => socket.data.panelRole);
         const displayName = panelSocket?.data.panelUsername || name;
-        const addresses = [...new Set(sockets.map(getSocketAddress).filter(Boolean))];
         const sites = [...new Set(sockets.map(getSocketSite))];
         const site = getSocketSite(sockets[0]);
         const connectedAt = sockets.map(socket => socket.data.connectedAt).sort()[0];
-        const bannedSites = [...new Set(addresses.flatMap(getBannedSites))];
-        const siteBanExpiries = Object.assign({}, ...addresses.map(getSiteBanExpiries));
+        const primarySocket = sockets[0];
+        const ipAddresses = [...new Set(sockets.map(getSocketAddress).filter(Boolean))];
+        const localBanStatus = getBanStatus(getSocketBanIdentity(primarySocket));
+        const ipBanStatus = getBanStatus(getSocketAddress(primarySocket));
         const isAdmin = sockets.some(isAdminSocket);
         return {
             id,
@@ -310,9 +357,12 @@ function handlePanelUsers(req, res, role) {
             isAdmin,
             isModerator: sockets.some(isModeratorSocket),
             panelRole: panelSocket?.data.panelRole || null,
-            moderatorBlocked: isAdmin || addresses.some(address => protectedAddresses.has(address)),
-            bannedSites,
-            siteBanExpiries,
+            moderatorBlocked: isAdmin,
+            localBannedSites: localBanStatus.bannedSites,
+            localSiteBanExpiries: localBanStatus.siteBanExpiries,
+            ipBannedSites: ipBanStatus.bannedSites,
+            ipSiteBanExpiries: ipBanStatus.siteBanExpiries,
+            ...(role === 'admin' ? { ipAddresses } : {}),
             connectedAt
         };
     });
@@ -326,8 +376,10 @@ function handleSiteBans(req, res, role) {
     if (!socket) return res.status(404).json({ error: 'User is no longer online' });
 
     const address = getSocketAddress(socket);
-    if (role === 'moderator' && (targetSockets.some(isAdminSocket) || getModeratorBlockedAddresses().has(address))) {
-        return res.status(403).json({ error: 'Moderators cannot change access for admin users or their shared connection' });
+    const scope = req.body?.scope === 'ip' ? 'ip' : 'local';
+    const identity = scope === 'ip' ? address : getSocketBanIdentity(socket);
+    if (role === 'moderator' && targetSockets.some(isAdminSocket)) {
+        return res.status(403).json({ error: 'Moderators cannot change access for admin users' });
     }
 
     const { siteBans } = req.body || {};
@@ -339,16 +391,22 @@ function handleSiteBans(req, res, role) {
     }
 
     if (!address) return res.status(400).json({ error: 'Could not identify this connection' });
+    const addressBelongsToAdmin = isKnownAdminAddress(address) ||
+        [...io.sockets.sockets.values()].some(candidate =>
+            getSocketAddress(candidate) === address && isAdminSocket(candidate));
+    if (role === 'moderator' && scope === 'ip' && addressBelongsToAdmin) {
+        return res.status(403).json({ error: 'Moderators cannot ban an IP address currently used by an admin' });
+    }
     const uniqueSiteBans = [...new Map(siteBans.map(ban => [ban.site, ban])).values()];
     const previousBans = new Map(activeBans);
 
-    activeBans.delete(address);
-    for (const site of adminSites) activeBans.delete(getSiteBanKey(address, site.path));
+    activeBans.delete(identity);
+    for (const site of adminSites) activeBans.delete(getSiteBanKey(identity, site.path));
 
     const expiresAtBySite = new Map();
     for (const ban of uniqueSiteBans) {
         const expiresAt = Date.now() + ban.duration * 1000;
-        activeBans.set(getSiteBanKey(address, ban.site), expiresAt);
+        activeBans.set(getSiteBanKey(identity, ban.site), expiresAt);
         expiresAtBySite.set(ban.site, expiresAt);
     }
 
@@ -363,12 +421,15 @@ function handleSiteBans(req, res, role) {
 
     for (const candidate of io.sockets.sockets.values()) {
         const duration = uniqueSiteBans.find(ban => ban.site === getSocketSite(candidate))?.duration;
-        if (getSocketAddress(candidate) !== address || !duration) continue;
+        const matchesScope = scope === 'ip'
+            ? getSocketAddress(candidate) === address
+            : getSocketBanIdentity(candidate) === identity;
+        if (!matchesScope || !duration) continue;
         io.to(candidate.id).emit('ban', duration);
         candidate.disconnect(true);
     }
 
-    return res.json({ siteBanExpiries: Object.fromEntries(expiresAtBySite) });
+    return res.json({ scope, siteBanExpiries: Object.fromEntries(expiresAtBySite) });
 }
 
 function handleBanUser(req, res, role) {
@@ -384,24 +445,26 @@ function handleBanUser(req, res, role) {
     const address = getSocketAddress(socket);
     const site = getSocketSite(socket);
     const scope = req.body?.scope === 'all' ? 'all' : 'page';
+    const identity = getSocketBanIdentity(socket);
     if (!address) return res.status(400).json({ error: 'Could not identify this connection' });
-    if (role === 'moderator' && (targetSockets.some(isAdminSocket) || getModeratorBlockedAddresses().has(address))) {
-        return res.status(403).json({ error: 'Moderators cannot ban admin users or their shared connection' });
+    if (role === 'moderator' && targetSockets.some(isAdminSocket)) {
+        return res.status(403).json({ error: 'Moderators cannot ban admin users' });
     }
 
     const expiresAt = Date.now() + duration * 1000;
-    activeBans.set(scope === 'all' ? address : getSiteBanKey(address, site), expiresAt);
+    const banKey = scope === 'all' ? identity : getSiteBanKey(identity, site);
+    activeBans.set(banKey, expiresAt);
     try {
         persistBans();
     } catch (error) {
-        activeBans.delete(scope === 'all' ? address : getSiteBanKey(address, site));
+        activeBans.delete(banKey);
         console.error('Failed to persist admin ban:', error.message || error);
         return res.status(500).json({ error: 'Could not save the ban' });
     }
 
     const name = normalizeName(socket.data.name);
     const affectedSockets = [...io.sockets.sockets.values()].filter(candidate =>
-        getSocketAddress(candidate) === address &&
+        getSocketBanIdentity(candidate) === identity &&
         (scope === 'all' || getSocketSite(candidate) === site)
     );
     for (const affectedSocket of affectedSockets) {
@@ -462,7 +525,23 @@ const io = new Server(server, {
 io.use((socket, next) => {
     const address = getSocketAddress(socket);
     const site = getSocketSite(socket);
-    const expiresAt = getBanExpiry(address) || getBanExpiry(getSiteBanKey(address, site));
+    const auth = socket.handshake.auth || {};
+    const panelRole = site === '/admin' || site === '/moderator' ? site.slice(1) : null;
+    const request = {
+        headers: { cookie: socket.handshake.headers.cookie || '' },
+        socket: { remoteAddress: socket.handshake.address }
+    };
+    const panelSession = panelRole ? getPanelSession(request, panelRole, true) : null;
+    const authenticatedAdmin = panelSession?.role === 'admin'
+        ? panelSession
+        : getPanelSession(request, 'admin', true);
+    const clientId = typeof auth.clientId === 'string' && auth.clientId.trim()
+        ? auth.clientId.slice(0, 100)
+        : getPresenceClientId(request) || socket.id;
+    const banIdentity = panelSession
+        ? `panel:${panelRole}:${panelSession.username}`
+        : `client:${clientId}`;
+    const expiresAt = getEffectiveBanExpiry(banIdentity, address, site, Boolean(authenticatedAdmin));
     if (expiresAt) {
         const error = new Error('This connection is temporarily banned');
         error.data = {
@@ -473,24 +552,14 @@ io.use((socket, next) => {
         return next(error);
     }
 
-    const identity = socket.handshake.auth || {};
-    const panelRole = site === '/admin' || site === '/moderator' ? site.slice(1) : null;
-    const panelSession = panelRole
-        ? getPanelSession({
-            headers: { cookie: socket.handshake.headers.cookie || '' },
-            socket: { remoteAddress: socket.handshake.address }
-        }, panelRole)
-        : null;
     if (panelSession) {
         socket.data.panelRole = panelRole;
         socket.data.panelUsername = panelSession.username;
         socket.data.clientId = `panel:${panelRole}:${panelSession.username}`;
         socket.data.name = normalizeName(panelSession.username);
     } else {
-        socket.data.clientId = typeof identity.clientId === 'string' && identity.clientId.trim()
-            ? identity.clientId.slice(0, 100)
-            : socket.id;
-        socket.data.name = normalizeName(identity.name);
+        socket.data.clientId = clientId;
+        socket.data.name = normalizeName(auth.name);
     }
     return next();
 });
