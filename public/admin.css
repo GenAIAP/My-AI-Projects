@@ -226,6 +226,26 @@ h1 {
     font-size: 12px;
 }
 
+.ip-disclosure {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.ip-disclosure summary {
+    width: fit-content;
+    color: var(--green-dark);
+    cursor: pointer;
+    font-weight: 650;
+}
+
+.ip-address {
+    display: block;
+    margin-top: 4px;
+    color: var(--ink);
+    font-family: Consolas, monospace;
+    overflow-wrap: anywhere;
+}
+
 .presence {
     display: inline-flex;
     align-items: center;
@@ -246,6 +266,26 @@ h1 {
 
 .site-access {
     padding: 0 20px 16px 72px;
+}
+
+.ban-scope-setting {
+    display: grid;
+    width: fit-content;
+    gap: 5px;
+    margin: 12px 0;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+}
+
+.ban-scope-setting select {
+    min-width: 250px;
+    padding: 7px 9px;
+    border: 1px solid #cbd5cc;
+    background: #fff;
+    color: var(--ink);
+    font: inherit;
+    font-weight: 500;
 }
 
 .site-access summary {
