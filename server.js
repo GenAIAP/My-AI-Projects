@@ -18,14 +18,21 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 const adminCredentials = JSON.parse(process.env.ADMIN_CREDENTIALS || '{}');
+const moderatorCredentials = JSON.parse(process.env.MODERATOR_CREDENTIALS || '{}');
 const sessionSecret = process.env.ADMIN_SESSION_SECRET;
-const adminCookieName = 'admin_session';
+const panelCookieNames = { admin: 'admin_session', moderator: 'moderator_session' };
 const adminSessionDuration = 8 * 60 * 60 * 1000;
 const adminBanStorePath = path.join(__dirname, '.admin-bans.json');
 const activeBans = new Map();
+const adminUserNames = new Set(
+    adminCredentials && typeof adminCredentials === 'object' && !Array.isArray(adminCredentials)
+        ? Object.keys(adminCredentials).map(name => name.toLowerCase())
+        : []
+);
 const adminSites = [
     { path: '/', label: 'Home' },
     { path: '/chat.html', label: 'Chat' },
+    { path: '/moderator', label: 'Moderator Panel' },
     { path: '/stock_predictor.html', label: 'Stock Predictor' },
     { path: '/results_chart.html', label: 'Results Chart' }
 ];
@@ -43,8 +50,11 @@ try {
 if (!sessionSecret || sessionSecret.length < 32 ||
     !adminCredentials || typeof adminCredentials !== 'object' ||
     Array.isArray(adminCredentials) || Object.keys(adminCredentials).length === 0 ||
-    Object.values(adminCredentials).some(password => typeof password !== 'string' || !password)) {
-    throw new Error('Set ADMIN_CREDENTIALS and a 32+ character ADMIN_SESSION_SECRET in .env');
+    Object.values(adminCredentials).some(password => typeof password !== 'string' || !password) ||
+    !moderatorCredentials || typeof moderatorCredentials !== 'object' ||
+    Array.isArray(moderatorCredentials) ||
+    Object.values(moderatorCredentials).some(password => typeof password !== 'string' || !password)) {
+    throw new Error('Set valid ADMIN_CREDENTIALS, optional MODERATOR_CREDENTIALS, and a 32+ character ADMIN_SESSION_SECRET in .env');
 }
 
 function safeStringEqual(left, right) {
@@ -179,22 +189,23 @@ function persistBans() {
     fs.renameSync(temporaryPath, adminBanStorePath);
 }
 
-function createAdminSession(username) {
+function createPanelSession(username, role, expiresAt = Date.now() + adminSessionDuration) {
     const payload = Buffer.from(JSON.stringify({
         username,
-        expiresAt: Date.now() + adminSessionDuration
+        role,
+        expiresAt
     })).toString('base64url');
     const signature = crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
     return `${payload}.${signature}`;
 }
 
-function getAdminSession(req) {
+function getPanelSession(req, role) {
     const cookieHeader = req.headers.cookie || '';
     const cookie = cookieHeader.split(';').map(value => value.trim())
-        .find(value => value.startsWith(`${adminCookieName}=`));
+        .find(value => value.startsWith(`${panelCookieNames[role]}=`));
     if (!cookie) return null;
 
-    const token = cookie.slice(adminCookieName.length + 1);
+    const token = cookie.slice(panelCookieNames[role].length + 1);
     const [payload, suppliedSignature] = token.split('.');
     if (!payload || !suppliedSignature) return null;
 
@@ -212,20 +223,27 @@ function getAdminSession(req) {
 
     try {
         const session = JSON.parse(Buffer.from(payload, 'base64url').toString());
-        if (session.expiresAt <= Date.now() || !Object.hasOwn(adminCredentials, session.username)) return null;
+        const credentials = role === 'admin' ? adminCredentials : moderatorCredentials;
+        if (session.expiresAt <= Date.now() ||
+            (session.role !== role && !(role === 'admin' && !session.role)) ||
+            !Object.hasOwn(credentials, session.username)) return null;
+        const address = normalizeAddress(req.socket?.remoteAddress);
+        if (role === 'moderator' && address &&
+            (getBanExpiry(address) || getBanExpiry(getSiteBanKey(address, '/moderator')))) return null;
         return session;
     } catch {
         return null;
     }
 }
 
-function renderAdminLogin(res) {
+function renderPanelLogin(res, role) {
+    const title = role === 'admin' ? 'Admin' : 'Moderator';
     res.set('Cache-Control', 'no-store').type('html').send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin sign in</title><style>
+<title>${title} sign in</title><style>
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#101616;color:#eef2ed;font:16px/1.5 system-ui,sans-serif}
 main{width:min(100%,380px);padding:32px;border:1px solid #35413b;background:#19211d}h1{margin:0 0 8px;font-size:26px}p{margin:0 0 24px;color:#aebbb2}label{display:block;margin:16px 0 6px;font-size:14px}input{width:100%;padding:12px;border:1px solid #46534b;background:#111814;color:#fff;font:inherit}button{width:100%;margin-top:22px;padding:12px;border:0;background:#b9e36a;color:#14200d;font:700 15px system-ui,sans-serif;cursor:pointer}button:hover{background:#c9f47a}
-</style></head><body><main><h1>Admin sign in</h1><p>Restricted access</p><form method="post" action="/admin/login">
+</style></head><body><main><h1>${title} sign in</h1><p>Restricted access</p><form method="post" action="/${role}/login">
 <label for="username">Username</label><input id="username" name="username" autocomplete="username" required>
 <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
 <button type="submit">Sign in</button></form></main></body></html>`);
@@ -236,52 +254,81 @@ function renderAccessDenied(res) {
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Access denied</title><style>
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#171311;color:#f5eee9;font:16px/1.5 system-ui,sans-serif}main{width:min(100%,480px);padding:36px;border-left:4px solid #ee765c;background:#241c19}h1{margin:0 0 10px;font-size:30px}p{margin:0 0 24px;color:#c5b7b0}a{color:#f4a28e}
-</style></head><body><main><h1>Access denied</h1><p>This account is not authorized to access the admin panel.</p><a href="/admin">Return to sign in</a></main></body></html>`);
+</style></head><body><main><h1>Access denied</h1><p>This account is not authorized to access this panel.</p><a href="/admin">Return to sign in</a></main></body></html>`);
 }
 
-app.get('/admin', (req, res) => {
-    if (!getAdminSession(req)) return renderAdminLogin(res);
-    res.set('Cache-Control', 'no-store').sendFile(path.join(__dirname, 'admin.html'));
-});
+function isAdminSocket(socket) {
+    return socket.data.panelRole === 'admin' ||
+        adminUserNames.has(normalizeName(socket.data.name).toLowerCase());
+}
 
-app.post('/admin/login', (req, res) => {
-    const { username, password } = req.body || {};
-    const expectedPassword = typeof username === 'string' ? adminCredentials[username] : null;
-    if (typeof expectedPassword !== 'string' || typeof password !== 'string' ||
-        !safeStringEqual(password, expectedPassword)) return renderAccessDenied(res);
+function isModeratorSocket(socket) {
+    return socket.data.panelRole === 'moderator';
+}
 
-    res.cookie(adminCookieName, createAdminSession(username), {
-        httpOnly: true,
-        sameSite: 'strict',
-        secure: process.env.NODE_ENV === 'production',
-        path: '/admin',
-        maxAge: adminSessionDuration
+function getPanelUserSockets(userId) {
+    return [...io.sockets.sockets.values()].filter(socket =>
+        socket.id === userId || socket.data.clientId === userId
+    );
+}
+
+function getModeratorBlockedAddresses() {
+    return new Set([...io.sockets.sockets.values()]
+        .filter(isAdminSocket)
+        .map(getSocketAddress)
+        .filter(Boolean));
+}
+
+function handlePanelUsers(req, res, role) {
+    if (!getPanelSession(req, role)) return res.status(403).json({ error: 'Access denied' });
+    const groups = new Map();
+    for (const socket of io.sockets.sockets.values()) {
+        const id = socket.data.clientId || socket.id;
+        if (!groups.has(id)) groups.set(id, []);
+        groups.get(id).push(socket);
+    }
+
+    const protectedAddresses = getModeratorBlockedAddresses();
+    const users = [...groups].map(([id, sockets]) => {
+        sockets.sort((left, right) => right.data.connectedAt.localeCompare(left.data.connectedAt));
+        const name = sockets.map(socket => normalizeName(socket.data.name)).find(value => value !== 'Guest') || 'Guest';
+        const panelSocket = sockets.find(socket => socket.data.panelRole);
+        const displayName = panelSocket?.data.panelUsername || name;
+        const addresses = [...new Set(sockets.map(getSocketAddress).filter(Boolean))];
+        const sites = [...new Set(sockets.map(getSocketSite))];
+        const site = getSocketSite(sockets[0]);
+        const connectedAt = sockets.map(socket => socket.data.connectedAt).sort()[0];
+        const bannedSites = [...new Set(addresses.flatMap(getBannedSites))];
+        const siteBanExpiries = Object.assign({}, ...addresses.map(getSiteBanExpiries));
+        const isAdmin = sockets.some(isAdminSocket);
+        return {
+            id,
+            name: displayName,
+            site,
+            sites,
+            socketCount: sockets.length,
+            isAdmin,
+            isModerator: sockets.some(isModeratorSocket),
+            panelRole: panelSocket?.data.panelRole || null,
+            moderatorBlocked: isAdmin || addresses.some(address => protectedAddresses.has(address)),
+            bannedSites,
+            siteBanExpiries,
+            connectedAt
+        };
     });
-    res.redirect(303, '/admin');
-});
-
-app.post('/admin/logout', (req, res) => {
-    res.clearCookie(adminCookieName, { httpOnly: true, sameSite: 'strict', path: '/admin' });
-    res.redirect(303, '/admin');
-});
-
-app.get('/admin/users', (req, res) => {
-    if (!getAdminSession(req)) return res.status(403).json({ error: 'Access denied' });
-    const users = [...io.sockets.sockets.values()].map(socket => ({
-        id: socket.id,
-        name: normalizeName(socket.data.name),
-        site: getSocketSite(socket),
-        bannedSites: getBannedSites(getSocketAddress(socket)),
-        siteBanExpiries: getSiteBanExpiries(getSocketAddress(socket)),
-        connectedAt: socket.data.connectedAt
-    }));
     res.set('Cache-Control', 'no-store').json({ users, sites: adminSites });
-});
+}
 
-app.post('/admin/users/:id/site-bans', (req, res) => {
-    if (!getAdminSession(req)) return res.status(403).json({ error: 'Access denied' });
-    const socket = io.sockets.sockets.get(req.params.id);
+function handleSiteBans(req, res, role) {
+    if (!getPanelSession(req, role)) return res.status(403).json({ error: 'Access denied' });
+    const targetSockets = getPanelUserSockets(req.params.id);
+    const socket = targetSockets[0];
     if (!socket) return res.status(404).json({ error: 'User is no longer online' });
+
+    const address = getSocketAddress(socket);
+    if (role === 'moderator' && (targetSockets.some(isAdminSocket) || getModeratorBlockedAddresses().has(address))) {
+        return res.status(403).json({ error: 'Moderators cannot change access for admin users or their shared connection' });
+    }
 
     const { siteBans } = req.body || {};
     if (!Array.isArray(siteBans) || siteBans.some(ban =>
@@ -291,7 +338,6 @@ app.post('/admin/users/:id/site-bans', (req, res) => {
         return res.status(400).json({ error: 'Choose valid sites and ban durations' });
     }
 
-    const address = getSocketAddress(socket);
     if (!address) return res.status(400).json({ error: 'Could not identify this connection' });
     const uniqueSiteBans = [...new Map(siteBans.map(ban => [ban.site, ban])).values()];
     const previousBans = new Map(activeBans);
@@ -323,11 +369,12 @@ app.post('/admin/users/:id/site-bans', (req, res) => {
     }
 
     return res.json({ siteBanExpiries: Object.fromEntries(expiresAtBySite) });
-});
+}
 
-app.post('/admin/users/:id/ban', (req, res) => {
-    if (!getAdminSession(req)) return res.status(403).json({ error: 'Access denied' });
-    const socket = io.sockets.sockets.get(req.params.id);
+function handleBanUser(req, res, role) {
+    if (!getPanelSession(req, role)) return res.status(403).json({ error: 'Access denied' });
+    const targetSockets = getPanelUserSockets(req.params.id);
+    const socket = targetSockets[0];
     if (!socket) return res.status(404).json({ error: 'User is no longer online' });
 
     const requestedDuration = req.body?.duration;
@@ -338,6 +385,9 @@ app.post('/admin/users/:id/ban', (req, res) => {
     const site = getSocketSite(socket);
     const scope = req.body?.scope === 'all' ? 'all' : 'page';
     if (!address) return res.status(400).json({ error: 'Could not identify this connection' });
+    if (role === 'moderator' && (targetSockets.some(isAdminSocket) || getModeratorBlockedAddresses().has(address))) {
+        return res.status(403).json({ error: 'Moderators cannot ban admin users or their shared connection' });
+    }
 
     const expiresAt = Date.now() + duration * 1000;
     activeBans.set(scope === 'all' ? address : getSiteBanKey(address, site), expiresAt);
@@ -359,7 +409,50 @@ app.post('/admin/users/:id/ban', (req, res) => {
         affectedSocket.disconnect(true);
     }
     return res.json({ message: `${name} was banned for ${duration} seconds`, expiresAt, scope, site });
-});
+}
+
+for (const role of ['admin', 'moderator']) {
+    app.get(`/${role}`, (req, res) => {
+        const session = getPanelSession(req, role);
+        if (!session) return renderPanelLogin(res, role);
+        res.cookie(panelCookieNames[role], createPanelSession(session.username, role, session.expiresAt), {
+            httpOnly: true,
+            sameSite: 'strict',
+            secure: process.env.NODE_ENV === 'production',
+            path: '/',
+            maxAge: Math.max(0, session.expiresAt - Date.now())
+        });
+        res.set('Cache-Control', 'no-store').sendFile(path.join(__dirname, 'admin.html'));
+    });
+
+    app.post(`/${role}/login`, (req, res) => {
+        const { username, password } = req.body || {};
+        const credentials = role === 'admin' ? adminCredentials : moderatorCredentials;
+        const expectedPassword = typeof username === 'string' ? credentials[username] : null;
+        if (typeof expectedPassword !== 'string' || typeof password !== 'string' ||
+            !safeStringEqual(password, expectedPassword)) return renderAccessDenied(res);
+
+        res.clearCookie(panelCookieNames[role], { httpOnly: true, sameSite: 'strict', path: `/${role}` });
+        res.cookie(panelCookieNames[role], createPanelSession(username, role), {
+            httpOnly: true,
+            sameSite: 'strict',
+            secure: process.env.NODE_ENV === 'production',
+            path: '/',
+            maxAge: adminSessionDuration
+        });
+        return res.redirect(303, `/${role}`);
+    });
+
+    app.post(`/${role}/logout`, (req, res) => {
+        res.clearCookie(panelCookieNames[role], { httpOnly: true, sameSite: 'strict', path: '/' });
+        res.clearCookie(panelCookieNames[role], { httpOnly: true, sameSite: 'strict', path: `/${role}` });
+        res.redirect(303, `/${role}`);
+    });
+
+    app.get(`/${role}/users`, (req, res) => handlePanelUsers(req, res, role));
+    app.post(`/${role}/users/:id/site-bans`, (req, res) => handleSiteBans(req, res, role));
+    app.post(`/${role}/users/:id/ban`, (req, res) => handleBanUser(req, res, role));
+}
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -370,15 +463,36 @@ io.use((socket, next) => {
     const address = getSocketAddress(socket);
     const site = getSocketSite(socket);
     const expiresAt = getBanExpiry(address) || getBanExpiry(getSiteBanKey(address, site));
-    if (!expiresAt) return next();
+    if (expiresAt) {
+        const error = new Error('This connection is temporarily banned');
+        error.data = {
+            code: 'USER_BANNED',
+            expiresAt,
+            remainingSeconds: Math.ceil((expiresAt - Date.now()) / 1000)
+        };
+        return next(error);
+    }
 
-    const error = new Error('This connection is temporarily banned');
-    error.data = {
-        code: 'USER_BANNED',
-        expiresAt,
-        remainingSeconds: Math.ceil((expiresAt - Date.now()) / 1000)
-    };
-    return next(error);
+    const identity = socket.handshake.auth || {};
+    const panelRole = site === '/admin' || site === '/moderator' ? site.slice(1) : null;
+    const panelSession = panelRole
+        ? getPanelSession({
+            headers: { cookie: socket.handshake.headers.cookie || '' },
+            socket: { remoteAddress: socket.handshake.address }
+        }, panelRole)
+        : null;
+    if (panelSession) {
+        socket.data.panelRole = panelRole;
+        socket.data.panelUsername = panelSession.username;
+        socket.data.clientId = `panel:${panelRole}:${panelSession.username}`;
+        socket.data.name = normalizeName(panelSession.username);
+    } else {
+        socket.data.clientId = typeof identity.clientId === 'string' && identity.clientId.trim()
+            ? identity.clientId.slice(0, 100)
+            : socket.id;
+        socket.data.name = normalizeName(identity.name);
+    }
+    return next();
 });
 
 let inferenceInProgress = false;
@@ -470,7 +584,9 @@ io.on('connection', (socket) => {
 
     socket.on('setName', (name) => {
         const cleanName = normalizeName(name);
-        socket.data.name = cleanName;
+        for (const candidate of io.sockets.sockets.values()) {
+            if (candidate.data.clientId === socket.data.clientId) candidate.data.name = cleanName;
+        }
         socket.emit('nameSet', { name: cleanName });
         io.emit('systemMessage', {
             type: 'system',
