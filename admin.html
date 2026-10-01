@@ -9,8 +9,8 @@
 </head>
 <body>
 	<header class="topbar">
-		<a class="wordmark" href="/admin" aria-label="Admin home"><span class="wordmark-mark">A</span>ADMIN</a>
-		<form action="/admin/logout" method="post">
+		<a class="wordmark" href="/admin" aria-label="Admin home"><span class="wordmark-mark" id="wordmark-mark">A</span><span id="wordmark-label">ADMIN</span></a>
+		<form id="logout-form" action="/admin/logout" method="post">
 			<button class="signout" type="submit">Sign out</button>
 		</form>
 	</header>
@@ -36,14 +36,26 @@
 		</section>
 	</main>
 
+	<script src="/presence.js"></script>
+	<script src="/socket.io/socket.io.js"></script>
 	<script>
 		const userList = document.getElementById('user-list');
 		const userCount = document.getElementById('user-count');
 		const updatedAt = document.getElementById('updated-at');
 		const emptyState = document.getElementById('empty-state');
 		const errorState = document.getElementById('error-state');
+		const panelBasePath = window.location.pathname === '/moderator' ? '/moderator' : '/admin';
+		const isModeratorPanel = panelBasePath === '/moderator';
+		const panelLabel = isModeratorPanel ? 'Moderator' : 'Admin';
+		const panelPresenceSocket = io(window.presenceSocketOptions());
+		window.watchForPresenceBans(panelPresenceSocket);
 		const expandedUsers = new Set();
 		const siteBanDrafts = new Map();
+		document.title = `${panelLabel} | Online users`;
+		document.getElementById('wordmark-mark').textContent = isModeratorPanel ? 'M' : 'A';
+		document.getElementById('wordmark-label').textContent = panelLabel.toUpperCase();
+		document.getElementById('logout-form').action = `${panelBasePath}/logout`;
+		document.querySelector('.eyebrow').innerHTML = `CONTROL PANEL <span>/</span> ${panelLabel.toUpperCase()} PRESENCE`;
 
 		function formatConnectedAt(value) {
 			const date = new Date(value);
@@ -71,8 +83,19 @@
 				name.textContent = user.name;
 				const connectedAt = document.createElement('span');
 				connectedAt.className = 'connected-at';
-				connectedAt.textContent = `${formatConnectedAt(user.connectedAt)} · ${user.site === '/' ? 'Home page' : user.site}`;
-				details.append(name, connectedAt);
+				const connectedSites = (user.sites || [user.site]).map(site =>
+					site === '/' ? 'Home' : site === '/moderator' ? 'Moderator panel' : site.replace(/^\//, '')
+				).join(', ');
+				const connectionCount = user.socketCount > 1 ? ` · ${user.socketCount} connections` : '';
+				connectedAt.textContent = `${formatConnectedAt(user.connectedAt)} · ${connectedSites}${connectionCount}`;
+				details.append(name);
+				if (user.panelRole) {
+					const roleBadge = document.createElement('span');
+					roleBadge.className = `panel-role ${user.panelRole}`;
+					roleBadge.textContent = `${user.panelRole} account`;
+					details.append(roleBadge);
+				}
+				details.append(connectedAt);
 
 				const accessDetails = document.createElement('details');
 				accessDetails.className = 'site-access';
@@ -85,25 +108,27 @@
 				summary.textContent = 'Manage site access';
 				const fieldset = document.createElement('fieldset');
 				const legend = document.createElement('legend');
-				legend.textContent = 'Checked sites are banned';
+				legend.textContent = 'Access by site';
 				fieldset.append(legend);
 				const userDraft = siteBanDrafts.get(user.id);
 
 				for (const site of sites) {
 					const siteRow = document.createElement('div');
 					siteRow.className = 'site-option';
-					const label = document.createElement('label');
-					label.className = 'site-name';
-					const checkbox = document.createElement('input');
-					checkbox.type = 'checkbox';
-					checkbox.value = site.path;
-					const savedDuration = userDraft?.get(site.path)?.duration ?? 30;
-					checkbox.checked = userDraft?.has(site.path)
+					siteRow.dataset.site = site.path;
+					const expiry = Number(user.siteBanExpiries?.[site.path]);
+					const remainingDuration = expiry > Date.now()
+						? Math.max(1, Math.ceil((expiry - Date.now()) / 1000))
+						: 30;
+					const savedDuration = userDraft?.get(site.path)?.duration ?? remainingDuration;
+					const isBanned = userDraft?.has(site.path)
 						? userDraft.get(site.path).banned
 						: user.bannedSites.includes(site.path);
 					const siteName = document.createElement('span');
+					siteName.className = 'site-name';
 					siteName.textContent = site.label;
-					label.append(checkbox, siteName);
+					const banState = document.createElement('span');
+					banState.className = 'ban-state';
 
 					const durationLabel = document.createElement('label');
 					durationLabel.className = 'duration-setting';
@@ -118,29 +143,47 @@
 					const secondsLabel = document.createElement('span');
 					secondsLabel.textContent = 'sec';
 					durationLabel.append(durationInput, secondsLabel);
+					const banButton = document.createElement('button');
+					banButton.className = 'site-ban-toggle';
+					banButton.type = 'button';
+					banButton.dataset.banned = String(isBanned);
+					const updateBanButton = () => {
+						const banned = banButton.dataset.banned === 'true';
+						banState.textContent = banned ? 'Banned' : 'Allowed';
+						banState.className = `ban-state${banned ? ' is-banned' : ''}`;
+						banButton.textContent = banned ? 'Unban' : 'Ban';
+						banButton.setAttribute('aria-label', `${banned ? 'Unban' : 'Ban'} ${site.label}`);
+						banButton.dataset.action = banned ? 'unban' : 'ban';
+					};
+					updateBanButton();
 
 					const updateDraft = () => {
 						const draft = new Map();
 						for (const row of fieldset.querySelectorAll('.site-option')) {
-							const siteCheckbox = row.querySelector('.site-name input');
+							const siteToggle = row.querySelector('.site-ban-toggle');
 							const siteDuration = row.querySelector('.duration-setting input');
-							draft.set(siteCheckbox.value, {
-								banned: siteCheckbox.checked,
+							draft.set(row.dataset.site, {
+								banned: siteToggle.dataset.banned === 'true',
 								duration: Number(siteDuration.value) || 30
 							});
 						}
 						siteBanDrafts.set(user.id, draft);
 					};
-					checkbox.addEventListener('change', updateDraft);
+					banButton.addEventListener('click', () => {
+						banButton.dataset.banned = String(banButton.dataset.banned !== 'true');
+						updateBanButton();
+						updateDraft();
+						saveButton.click();
+					});
 					durationInput.addEventListener('input', updateDraft);
-					siteRow.append(label, durationLabel);
+					siteRow.append(siteName, banState, durationLabel, banButton);
 					fieldset.append(siteRow);
 				}
 
 				const saveButton = document.createElement('button');
 				saveButton.className = 'save-site-bans';
 				saveButton.type = 'button';
-				saveButton.textContent = 'Save access';
+				saveButton.textContent = 'Save changes';
 				const saveStatus = document.createElement('span');
 				saveStatus.className = 'save-status';
 				saveButton.addEventListener('click', async () => {
@@ -149,19 +192,19 @@
 					try {
 						const siteBans = [];
 						for (const siteRow of fieldset.querySelectorAll('.site-option')) {
-							const checkbox = siteRow.querySelector('.site-name input');
+							const banButton = siteRow.querySelector('.site-ban-toggle');
 							const durationInput = siteRow.querySelector('.duration-setting input');
-							if (!checkbox.checked) continue;
+							if (banButton.dataset.banned !== 'true') continue;
 							if (!durationInput.reportValidity()) throw new Error('Enter a valid duration');
-							siteBans.push({ site: checkbox.value, duration: Number(durationInput.value) });
+							siteBans.push({ site: siteRow.dataset.site, duration: Number(durationInput.value) });
 						}
-						const response = await fetch(`/admin/users/${encodeURIComponent(user.id)}/site-bans`, {
+						const response = await fetch(`${panelBasePath}/users/${encodeURIComponent(user.id)}/site-bans`, {
 							method: 'POST',
 							headers: { 'Content-Type': 'application/json' },
 							body: JSON.stringify({ siteBans })
 						});
 						if (response.status === 403) {
-							window.location.assign('/admin');
+							window.location.assign(panelBasePath);
 							return;
 						}
 						if (response.status === 404) {
@@ -182,6 +225,13 @@
 				presence.className = 'presence';
 				presence.innerHTML = '<span class="live-dot" aria-hidden="true"></span>Online';
 				row.append(avatar, details, presence);
+				if (isModeratorPanel && user.moderatorBlocked) {
+					accessDetails.hidden = true;
+					const protectedStatus = document.createElement('span');
+					protectedStatus.className = 'protected-status';
+					protectedStatus.textContent = user.isAdmin ? 'Admin account' : 'Shared admin connection';
+					row.append(protectedStatus);
+				}
 				entry.append(row, accessDetails);
 				userList.append(entry);
 			}
@@ -193,9 +243,9 @@
 
 		async function refreshUsers() {
 			try {
-				const response = await fetch('/admin/users', { cache: 'no-store' });
+				const response = await fetch(`${panelBasePath}/users`, { cache: 'no-store' });
 				if (response.status === 403) {
-					window.location.assign('/admin');
+					window.location.assign(panelBasePath);
 					return;
 				}
 				if (!response.ok) throw new Error('Unable to load users');
