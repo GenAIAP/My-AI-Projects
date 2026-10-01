@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>S&P 500 AI Quant Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="/presence.js"></script>
     <script src="/socket.io/socket.io.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0b0f19; color: #f1f5f9; padding: 25px; margin: 0; }
@@ -4763,7 +4764,8 @@
         }
 
         try {
-            socket = io();
+            socket = io(window.presenceSocketOptions());
+            window.watchForPresenceBans(socket);
             socket.on('connect', () => {
                 const b = document.getElementById('serverBadge');
                 b.textContent = 'LIVE SERVER';
@@ -4845,36 +4847,58 @@
 
             try {
                 const res = await fetch('/api/stock-forecast/' + encodeURIComponent(ticker));
-                if (!res.ok) return;
-                const data = await res.json();
-                renderIndividualChart(data);
+                const payload = await res.json().catch(() => null);
+
+                if (!res.ok || !payload || payload.error) {
+                    showToast(payload?.error || 'No forecast data available for this ticker');
+                    return;
+                }
+
+                renderIndividualChart(payload);
             } catch (err) {
                 console.error(err);
+                showToast('Unable to load stock forecast data');
             }
         }
 
         function renderIndividualChart(data) {
-            document.getElementById('detailTicker').textContent = data.ticker;
-            document.getElementById('detailRank').textContent = '#' + data.rank;
-            document.getElementById('detailSnr').textContent = (data.snr >= 0 ? '+' : '') + data.snr.toFixed(4);
-            document.getElementById('detailReturn').textContent = (data.expectedReturn5d >= 0 ? '+' : '') + data.expectedReturn5d.toFixed(2) + '%';
-            document.getElementById('detailReturn').style.color = data.expectedReturn5d >= 0 ? '#4ade80' : '#f87171';
-            document.getElementById('detailUncertainty').textContent = data.uncertainty5d.toFixed(4);
+            const safeData = data && typeof data === 'object' && !('error' in data) ? data : {};
+
+            const ticker = String(safeData.ticker || currentSelectedTicker || 'AAPL');
+            const rank = Number.isFinite(Number(safeData.rank)) ? Number(safeData.rank) : 1;
+            const snr = Number(safeData.snr ?? 0);
+            const expectedReturn = Number(safeData.expectedReturn5d ?? safeData.expectedReturn ?? 0);
+            const uncertainty = Number(safeData.uncertainty5d ?? safeData.uncertainty ?? 0);
+            const direction = String(safeData.direction || (snr >= 0 ? 'Bullish' : 'Bearish'));
+            const group = String(safeData.group || 'Neutral');
+            const labels = Array.isArray(safeData.labels) && safeData.labels.length ? safeData.labels : ['t-5', 't-4', 't-3', 't-2', 't-1', 't+1', 't+2', 't+3', 't+4', 't+5'];
+            const upperBand = Array.isArray(safeData.upperBand) ? safeData.upperBand : new Array(labels.length).fill(null);
+            const lowerBand = Array.isArray(safeData.lowerBand) ? safeData.lowerBand : new Array(labels.length).fill(null);
+            const historical = Array.isArray(safeData.historical) ? safeData.historical : new Array(labels.length).fill(null);
+            const projection = Array.isArray(safeData.projection) ? safeData.projection : new Array(labels.length).fill(null);
+
+            const isBullish = expectedReturn >= 0 || /bullish/i.test(direction);
+
+            document.getElementById('detailTicker').textContent = ticker;
+            document.getElementById('detailRank').textContent = '#' + rank;
+            document.getElementById('detailSnr').textContent = (snr >= 0 ? '+' : '') + Number(snr).toFixed(4);
+            document.getElementById('detailReturn').textContent = (expectedReturn >= 0 ? '+' : '') + Number(expectedReturn).toFixed(2) + '%';
+            document.getElementById('detailReturn').style.color = isBullish ? '#4ade80' : '#f87171';
+            document.getElementById('detailUncertainty').textContent = Number(uncertainty).toFixed(4);
 
             const dirEl = document.getElementById('detailDirection');
-            dirEl.textContent = (data.snr >= 0 ? '▲ ' : '▼ ') + data.direction;
-            dirEl.style.color = data.snr >= 0 ? '#4ade80' : '#f87171';
+            dirEl.textContent = (isBullish ? '▲ ' : '▼ ') + direction;
+            dirEl.style.color = isBullish ? '#4ade80' : '#f87171';
 
             const tagEl = document.getElementById('selectedStockTag');
-            tagEl.textContent = data.group.toUpperCase();
-            if (data.group === 'Top Long') tagEl.className = 'badge badge-green';
-            else if (data.group === 'Top Short') tagEl.className = 'badge badge-red';
+            tagEl.textContent = group.toUpperCase();
+            if (group === 'Top Long') tagEl.className = 'badge badge-green';
+            else if (group === 'Top Short') tagEl.className = 'badge badge-red';
             else tagEl.className = 'badge badge-neutral';
 
-            const isBullish = data.snr >= 0;
-            const primaryColor = isBullish ? '#38bdf8' : '#f43f5e';
-            const projColor = isBullish ? '#4ade80' : '#f87171';
-            const bandFill = isBullish ? 'rgba(56, 189, 248, 0.12)' : 'rgba(244, 63, 94, 0.12)';
+            const primaryColor = isBullish ? '#22c55e' : '#f43f5e';
+            const projColor = isBullish ? '#34d399' : '#fca5a5';
+            const bandFill = isBullish ? 'rgba(34, 197, 94, 0.12)' : 'rgba(248, 113, 113, 0.12)';
 
             if (individualStockChartInstance) {
                 individualStockChartInstance.destroy();
@@ -4883,11 +4907,11 @@
             individualStockChartInstance = new Chart(document.getElementById('individualStockChart'), {
                 type: 'line',
                 data: {
-                    labels: data.labels,
+                    labels,
                     datasets: [
                         {
                             label: 'Upper Uncertainty Band (+σ)',
-                            data: data.upperBand,
+                            data: upperBand,
                             borderColor: 'transparent',
                             backgroundColor: bandFill,
                             fill: '+1',
@@ -4895,7 +4919,7 @@
                         },
                         {
                             label: 'Lower Uncertainty Band (-σ)',
-                            data: data.lowerBand,
+                            data: lowerBand,
                             borderColor: 'transparent',
                             backgroundColor: 'transparent',
                             fill: false,
@@ -4903,7 +4927,7 @@
                         },
                         {
                             label: 'Historical Price',
-                            data: data.historical,
+                            data: historical,
                             borderColor: primaryColor,
                             backgroundColor: primaryColor,
                             borderWidth: 2.5,
@@ -4912,7 +4936,7 @@
                         },
                         {
                             label: 'Predicted Trajectory (Horizon μ)',
-                            data: data.projection,
+                            data: projection,
                             borderColor: projColor,
                             backgroundColor: projColor,
                             borderWidth: 3,
@@ -4997,10 +5021,11 @@
                 x: Number(p.uncertainty5d.toFixed(3)),
                 y: Number(p.expectedReturn5d.toFixed(2)),
                 ticker: p.ticker,
-                snr: Number(p.snr.toFixed(4))
+                snr: Number(p.snr.toFixed(4)),
+                bullish: Number(p.expectedReturn5d || 0) >= 0
             }));
             scatterChartInstance.data.datasets[0].data = newScatter;
-            scatterChartInstance.data.datasets[0].backgroundColor = newScatter.map(d => d.snr >= 0 ? 'rgba(56, 189, 248, 0.7)' : 'rgba(244, 63, 94, 0.7)');
+            scatterChartInstance.data.datasets[0].backgroundColor = newScatter.map(d => d.bullish ? 'rgba(34, 197, 94, 0.7)' : 'rgba(239, 68, 68, 0.7)');
             scatterChartInstance.update();
 
             const topK = data.topK;
@@ -5011,11 +5036,12 @@
                 else if (idx >= predictions.length - topK) tag = '<span class="badge badge-red">Short</span>';
 
                 const rowTicker = String(p.ticker).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                const bullishRow = Number(p.expectedReturn5d || 0) >= 0;
                 return '<tr data-ticker="' + rowTicker + '" style="cursor: pointer;" onclick="selectStock(\'' + rowTicker + '\')">' +
                     '<td><strong>' + (idx + 1) + '</strong></td>' +
                     '<td><strong>' + rowTicker + '</strong></td>' +
-                    '<td style="color:' + (p.snr >= 0 ? '#4ade80' : '#f87171') + '">' + p.snr.toFixed(4) + '</td>' +
-                    '<td>' + (p.expectedReturn5d >= 0 ? '+' : '') + p.expectedReturn5d.toFixed(2) + '%</td>' +
+                    '<td style="color:' + (bullishRow ? '#4ade80' : '#f87171') + '">' + (p.snr >= 0 ? '+' : '') + p.snr.toFixed(4) + '</td>' +
+                    '<td style="color:' + (bullishRow ? '#4ade80' : '#f87171') + '">' + (p.expectedReturn5d >= 0 ? '+' : '') + p.expectedReturn5d.toFixed(2) + '%</td>' +
                     '<td>' + p.uncertainty5d.toFixed(4) + '</td>' +
                     '<td>' + tag + '</td>' +
                     '<td><button class="btn-micro" onclick="event.stopPropagation(); selectStock(\'' + rowTicker + '\')">Forecast</button></td>' +
