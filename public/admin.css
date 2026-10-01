@@ -2,10 +2,11 @@
     color-scheme: light;
     --ink: #19241f;
     --muted: #717d76;
-    --line: #e1e7e2;
-    --paper: #f5f7f4;
+    --line: #dce3dc;
+    --paper: #f1f4ef;
     --green: #b9e36a;
     --green-dark: #3b6138;
+    --signal: #c15c45;
 }
 
 * {
@@ -17,7 +18,7 @@ body {
     min-height: 100vh;
     background-color: var(--paper);
     background-image: linear-gradient(rgba(48, 80, 56, 0.035) 1px, transparent 1px), linear-gradient(90deg, rgba(48, 80, 56, 0.035) 1px, transparent 1px);
-    background-size: 32px 32px;
+    background-size: 28px 28px;
     color: var(--ink);
     font-family: 'Segoe UI', Tahoma, sans-serif;
 }
@@ -75,7 +76,7 @@ button {
 }
 
 .content {
-    width: min(100% - 48px, 900px);
+    width: min(100% - 48px, 980px);
     margin: 0 auto;
     padding: 64px 0 80px;
 }
@@ -113,6 +114,7 @@ h1 {
 
 .user-section {
     border-top: 1px solid #aeb9b0;
+    background: rgba(255, 255, 255, 0.74);
 }
 
 .section-heading {
@@ -121,6 +123,7 @@ h1 {
     align-items: center;
     justify-content: space-between;
     gap: 16px;
+    padding: 0 20px;
     border-bottom: 1px solid var(--line);
 }
 
@@ -168,6 +171,7 @@ h1 {
     min-height: 74px;
     align-items: center;
     gap: 14px;
+    padding: 0 20px;
 }
 
 .avatar {
@@ -195,6 +199,28 @@ h1 {
     font-weight: 600;
 }
 
+.panel-role {
+    width: fit-content;
+    padding: 2px 6px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 650;
+    text-transform: capitalize;
+}
+
+.panel-role.admin {
+    border-color: #cbd8cb;
+    background: #edf4e9;
+    color: var(--green-dark);
+}
+
+.panel-role.moderator {
+    border-color: #e7c5bb;
+    background: #fbefeb;
+    color: #8c3f30;
+}
+
 .connected-at {
     color: var(--muted);
     font-size: 12px;
@@ -209,8 +235,17 @@ h1 {
     font-size: 12px;
 }
 
+.protected-status {
+    padding: 5px 8px;
+    border: 1px solid #e7c5bb;
+    background: #fbefeb;
+    color: #8c3f30;
+    font-size: 11px;
+    font-weight: 650;
+}
+
 .site-access {
-    padding: 0 0 12px 52px;
+    padding: 0 20px 16px 72px;
 }
 
 .site-access summary {
@@ -223,11 +258,12 @@ h1 {
 
 .site-access fieldset {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-    gap: 8px 12px;
+    grid-template-columns: 1fr;
+    gap: 0;
     margin: 12px 0;
-    padding: 0;
-    border: 0;
+    padding: 12px;
+    border: 1px solid var(--line);
+    background: #f7f9f6;
 }
 
 .site-access legend {
@@ -237,22 +273,64 @@ h1 {
 }
 
 .site-option {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(90px, 1fr) auto auto auto;
     align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
     color: var(--ink);
     font-size: 12px;
 }
 
 .site-name {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
+    font-weight: 600;
 }
 
-.site-name input {
-    accent-color: #a34636;
+.ban-state {
+    min-width: 62px;
+    padding: 4px 6px;
+    border: 1px solid #cbd8cb;
+    background: #edf4e9;
+    color: var(--green-dark);
+    font-size: 10px;
+    font-weight: 700;
+    text-align: center;
+}
+
+.ban-state.is-banned {
+    border-color: #e7c5bb;
+    background: #fbefeb;
+    color: #8c3f30;
+}
+
+.site-ban-toggle {
+    min-width: 62px;
+    padding: 6px 9px;
+    border: 1px solid #bdcbbb;
+    background: #fff;
+    color: var(--green-dark);
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 650;
+    white-space: nowrap;
+}
+
+.site-ban-toggle:hover {
+    border-color: var(--green-dark);
+}
+
+.site-ban-toggle[data-action="ban"] {
+    border-color: #e7c5bb;
+    background: #fbefeb;
+    color: #8c3f30;
+}
+
+.site-ban-toggle[data-action="unban"] {
+    border-color: #bdcbbb;
+    background: #fff;
+    color: var(--green-dark);
 }
 
 .duration-setting {
@@ -265,17 +343,23 @@ h1 {
 .duration-setting input {
     width: 72px;
     padding: 5px 6px;
-    border: 1px solid #d0d8d1;
+    border: 1px solid #cbd5cc;
     background: #fff;
     color: var(--ink);
     font: inherit;
     font-variant-numeric: tabular-nums;
 }
 
+.duration-setting input:disabled {
+    background: #edf0ed;
+    color: #87918a;
+    cursor: not-allowed;
+}
+
 .save-site-bans {
     padding: 7px 11px;
-    border: 1px solid #cbd8cb;
-    background: #eaf1e8;
+    border: 1px solid #b9c9b6;
+    background: #e7efe4;
     color: var(--green-dark);
     cursor: pointer;
     font-size: 12px;
@@ -296,13 +380,20 @@ h1 {
 .empty-state,
 .error-state {
     margin: 0;
-    padding: 26px 0;
+    padding: 26px 20px;
     color: var(--muted);
     font-size: 14px;
 }
 
 .error-state {
     color: #a34636;
+}
+
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+    outline: 2px solid #497944;
+    outline-offset: 2px;
 }
 
 @media (max-width: 600px) {
@@ -324,9 +415,13 @@ h1 {
         font-size: 34px;
     }
 
+    .section-heading {
+        padding: 0 14px;
+    }
+
     .user-row {
         flex-wrap: wrap;
-        padding: 12px 0;
+        padding: 12px 14px;
     }
 
     .user-details {
@@ -334,7 +429,29 @@ h1 {
     }
 
     .site-access {
-        padding-left: 0;
+        padding: 0 14px 14px;
+    }
+
+    .site-option {
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 7px 10px;
+    }
+
+    .site-name {
+        grid-column: 1;
+    }
+
+    .ban-state {
+        grid-column: 2;
+        grid-row: 1;
+    }
+
+    .duration-setting {
+        grid-column: 1;
+    }
+
+    .site-ban-toggle {
+        grid-column: 2;
     }
 
     .presence {
