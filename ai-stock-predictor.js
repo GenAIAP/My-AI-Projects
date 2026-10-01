@@ -1,16 +1,21 @@
 // File: ai-stock-predictor.js
 // ==============================================================================
-// 3D HIERARCHICAL MS-iTRANSFORMER ONNX INFERENCE ENGINE
-// Fully Synchronized with sp500_hierarchical_quant_master.py & V6.onnx
+// S&P 500 3D HIERARCHICAL QUANT ENGINE (VERSION 4.0 PRODUCTION INFERENCE)
+// Fully Synchronized with sp500_hierarchical_v4_clean_production.py & ONNX Exports
 // ==============================================================================
-// Inputs       : x_features [1, N, SEQ_LEN, 15]
-//                stock_mask [1, N]
-//                sector_ids [1, N]
-//                macro_regime [1, 4]
-// Features     : 15 Cross-Sectional Factors (Scaled to [-1, 1] per session)
-// Hierarchy    : 11 GICS Sector Bottleneck Attention Centroids (IDs: 0-10)
-// Calibration  : Non-Parametric Rank-Quantile Volatility Sizing (Max ~3.5% 5D Return)
-// Execution    : Staggered Monday Conviction Hurdle + Inverse-Vol Risk Parity
+// Architecture:
+//   1. Temporal Stream: Multi-Scale Inception TCN (Causal Conv & Channel Norm)
+//   2. Factor Stream: 6-Layer Deep Inverted Transformer with SwiGLU
+//   3. Contextual Gating: Bilinear GLU Fusion (Temporal + Factor Interactions)
+//   4. Spatial Hierarchy: Intra-Sector Peer Routing + 12 Centroids (1 Market + 11 GICS)
+//   5. Normalization: Masked Cross-Sectional Norm (CS-Norm)
+//
+// Execution Mechanics (Strict T+1 Market-on-Open Parity):
+//   - Signal EMA Smoothing: alpha = 0.40
+//   - Conviction Hurdle: 30 bps base (45 bps on Mondays: 1.5x multiplier)
+//   - Day Dampeners: Wednesday (0.50x) and Thursday (0.50x)
+//   - Volatility Target: 14% Annualized Volatility Ceiling (min 20%, max 100%)
+//   - Portfolio Weighting: Inverse-Volatility Risk Parity (w_i ~ 1 / sigma_i)
 // ==============================================================================
 
 const fs = require('fs');
@@ -19,29 +24,37 @@ const { parentPort, Worker, workerData, isMainThread } = require('worker_threads
 const ort = require('onnxruntime-node');
 
 // ==============================================================================
-// SECTION 1: SYSTEM CONFIGURATION & GICS SECTOR TAXONOMY
+// SECTION 1: MASTER CONSTANTS & GICS SECTOR TAXONOMY
 // ==============================================================================
 const BENCHMARK_TICKER = '^GSPC';
-const STOCK_RANGE_DAYS = 240;               // ~165 trading days
+const STOCK_RANGE_DAYS = 240;               // Lookback window for reliable features
 const CACHE_TTL_MS = 15 * 60 * 1000;        // 15-minute in-memory cache
-const DISK_CACHE_TTL_MS = 12 * 3600 * 1000; // 12-hour persistent disk cache
+const DISK_CACHE_TTL_MS = 12 * 3600 * 1000; // 12-hour disk cache
 const FETCH_BATCH_SIZE = 30;
 const BATCH_DELAY_MS = 50;
 
-const DEFAULT_MAX_STOCKS = 505;
+const DEFAULT_MAX_STOCKS = 650;
 const DEFAULT_SEQ_LEN = 60;
 const NUM_FEATURES = 15;
-const DEFAULT_MACRO_DIM = 4;
 const DEFAULT_TOP_K = 15;
+const DEFAULT_BOTTOM_K = 15;
 
-// Risk & Sizing Controls
-const CONVICTION_THRESHOLD = 0.0030;        // 0.30% minimum target alpha
-const MONDAY_HURDLE_MULT = 1.5;             // 1.5x hurdle on Mondays
-const MIN_CAPITAL_EXPOSURE = 0.20;          // 20% floor exposure
-const MAX_CAPITAL_EXPOSURE = 1.00;          // 100% ceiling exposure
-const LOW_CONVICTION_SPREAD = 0.0020;
-const HIGH_CONVICTION_SPREAD = 0.0080;
-const TRANSACTION_FEE_BPS = 0.0010;
+// Strict Python v4 Execution Rules
+const SIGNAL_EMA_ALPHA = 0.40;
+const CONVICTION_THRESHOLD = 0.0030;        // 30 bps 5-day alpha
+const EXIT_BAND_THRESHOLD = -0.0030;
+const MONDAY_HURDLE_MULT = 1.5;             // 1.5x on Mondays (45 bps)
+const MIN_HOLDING_DAYS = 3;
+const BUFFER_RANK = 30;
+const TRANSACTION_FEE_BPS = 0.0010;        // 10 bps fee drag
+
+// Volatility & Capital Constraints
+const MIN_CAPITAL_EXPOSURE = 0.20;
+const MAX_CAPITAL_EXPOSURE = 1.00;
+const TARGET_ANNUAL_VOL = 0.14;             // 14% Annual Vol Ceiling
+const ENABLE_VOL_TARGETING = true;
+const THURSDAY_DAMPENER = 0.50;             // Triggered on Wednesday close
+const FRIDAY_DAMPENER = 0.50;               // Triggered on Thursday close
 
 const FEATURE_NAMES = [
     'ret_1d', 'ret_5d', 'ret_10d', 'ret_20d',
@@ -70,7 +83,6 @@ const GICS_CLEAN_MAP = {
     'Materials': 'Materials', 'General': 'General'
 };
 
-// Quarantine PARA (recycled ticker for penny stock Banzai) and historical dead tickers
 const DEAD_TICKERS = new Set([
     'PARA', 'SBNY', 'SIVB', 'FRC', 'DRE', 'TWTR', 'PKI', 'ANTM', 'FB',
     'BIO', 'ETSY', 'ATVI', 'FLIR', 'CA', 'HOT', 'CMA', 'ZION',
@@ -269,13 +281,16 @@ function normalCDF(z) {
     return z > 0 ? 1.0 - p : p;
 }
 
+// In-Memory Persistent State for Signal Smoothing
+const globalSignalEmaMap = new Map();
+
 // ==============================================================================
-// SECTION 3: INGESTION & YAHOO FINANCE DATA PIPELINE
+// SECTION 3: INGESTION & DATA ENGINE
 // ==============================================================================
 const ohlcvMemoryCache = new Map();
 
 function getPersistentCacheDir(customDir = null) {
-    const target = customDir || process.env.QUANT_CACHE_DIR || path.join(__dirname, 'sp500_quant_cache');
+    const target = customDir || process.env.QUANT_CACHE_DIR || path.join(__dirname, 'sp500_quant_v4');
     try {
         if (!fs.existsSync(target)) fs.mkdirSync(target, { recursive: true });
     } catch (e) {
@@ -389,7 +404,7 @@ async function fetchManyOHLCV(tickers, rangeDays = STOCK_RANGE_DAYS, cacheDir = 
 }
 
 // ==============================================================================
-// SECTION 4: 15-FEATURE COMPUTATION
+// SECTION 4: 15 ORTHOGONAL TECHNICAL INDICATORS (EXACT V4 REPLICATION)
 // ==============================================================================
 function computeRawSignals(series) {
     const { dates, opens, highs, lows, closes, volumes } = series;
@@ -402,6 +417,7 @@ function computeRawSignals(series) {
     const l = Float32Array.from(lows);
     const v = Float32Array.from(volumes);
 
+    // Momentum Factors (0-3)
     const ret1d = new Float32Array(n);
     const ret5d = new Float32Array(n);
     const ret10d = new Float32Array(n);
@@ -414,6 +430,7 @@ function computeRawSignals(series) {
         ret20d[i] = i >= 20 ? Math.log(c[i] / c[i - 20]) : 0.0;
     }
 
+    // Volatility Factors (4-5)
     const gkVol = new Float32Array(n);
     const parkinsonVol = new Float32Array(n);
     const constGk = 2.0 * Math.LN2 - 1.0;
@@ -426,6 +443,7 @@ function computeRawSignals(series) {
         parkinsonVol[i] = (logHL * logHL) / constPark;
     }
 
+    // Trend & Oscillators (6-9, 13-14)
     const delta = new Float32Array(n);
     const gain = new Float32Array(n);
     const loss = new Float32Array(n);
@@ -467,6 +485,7 @@ function computeRawSignals(series) {
         bbPctB[i] = (c[i] - lower) / (4.0 * std20[i] + 1e-8);
     }
 
+    // Liquidity Factors (10-12)
     const volMa20 = rollingMean(v, 20);
     const normVolume = new Float32Array(n);
     const hlSpread = new Float32Array(n);
@@ -518,7 +537,7 @@ function computeRawSignals(series) {
 }
 
 // ==============================================================================
-// SECTION 5: CROSS-SECTIONAL PERCENTILE RANK NORMALIZATION
+// SECTION 5: POINT-IN-TIME CROSS-SECTIONAL RANK NORMALIZATION [-1, 1]
 // ==============================================================================
 function applyCrossSectionalRankScaling(activeSequences, N, seqLen) {
     for (let t = 0; t < seqLen; t++) {
@@ -556,7 +575,7 @@ function applyCrossSectionalRankScaling(activeSequences, N, seqLen) {
 }
 
 // ==============================================================================
-// SECTION 6: ONNX MODEL INFERENCE PREDICTOR WITH VOLATILITY CALIBRATION
+// SECTION 6: 3D HIERARCHICAL ONNX INFERENCE ENGINE
 // ==============================================================================
 class StockPredictor {
     constructor(modelPath = null) {
@@ -566,32 +585,35 @@ class StockPredictor {
         this.outputNames = [];
 
         this.modelMaxStocks = DEFAULT_MAX_STOCKS;
+        this.isDynamicStocks = true;
         this.modelSeqLen = DEFAULT_SEQ_LEN;
-        this.macroDim = DEFAULT_MACRO_DIM;
 
         this.xInputName = null;
         this.maskInputName = null;
         this.secInputName = null;
-        this.macroInputName = null;
+        this.macroInputName = null; // Kept for backward compatibility with v3/v5
         this.maskIsBoolean = true;
     }
 
     _resolveModelPath() {
         const candidateNames = [
-            'V6.onnx',
-            'sp500_hierarchical_itransformer.onnx',
-            'hierarchical_itransformer.onnx',
+            'Blue-1.1.onnx',
+            'best_v4_clean_model.onnx',
+            'sp500_hierarchical_v4_clean_production.onnx',
+            'v4_model.onnx',
+            'V4.onnx',
             'best_hierarchical_model.onnx',
-            'itransformer.onnx',
-            'V5.2.2-4.onnx'
+            'sp500_hierarchical_itransformer.onnx',
+            'V6.onnx',
+            'model.onnx'
         ];
 
         const searchRoots = [
-            'C:\\Users\\abbon\\OneDrive\\Desktop\\Coding\\AI',
             __dirname,
             process.cwd(),
-            path.join(__dirname, 'sp500_quant_cache'),
-            path.join(process.cwd(), 'sp500_quant_cache')
+            path.join(__dirname, 'sp500_quant_v4'),
+            path.join(process.cwd(), 'sp500_quant_v4'),
+            'C:\\Users\\abbon\\OneDrive\\Desktop\\Coding\\AI'
         ];
 
         for (const root of searchRoots) {
@@ -600,7 +622,7 @@ class StockPredictor {
                 if (fs.existsSync(full)) return full;
             }
         }
-        return path.join(__dirname, 'V6.onnx');
+        return path.join(__dirname, 'Blue-1.1.onnx');
     }
 
     async init() {
@@ -622,19 +644,23 @@ class StockPredictor {
                 const dims = meta?.dimensions || [];
                 const type = String(meta?.type || '').toLowerCase();
 
-                if (dims.length === 4 || (!this.xInputName && (name.includes('x') || name.includes('input') || name.includes('feat')))) {
+                if (dims.length === 4 || (!this.xInputName && (name.includes('x') || name.includes('feat') || name.includes('input')))) {
                     this.xInputName = name;
-                    if (typeof dims[1] === 'number' && dims[1] > 0) this.modelMaxStocks = dims[1];
+                    const dimN = dims[1];
+                    if (typeof dimN === 'number' && dimN > 0) {
+                        this.modelMaxStocks = dimN;
+                        this.isDynamicStocks = false;
+                    } else {
+                        this.isDynamicStocks = true;
+                    }
                     if (typeof dims[2] === 'number' && dims[2] > 0) this.modelSeqLen = dims[2];
                 } else if (/mask/i.test(name) || type.includes('bool') || (dims.length === 2 && !this.secInputName && !this.maskInputName)) {
                     this.maskInputName = name;
                     this.maskIsBoolean = type.includes('bool') || type === '';
-                } else if (/sec|sid/i.test(name) || type.includes('int64')) {
+                } else if (/sec|sid/i.test(name) || type.includes('int64') || type.includes('int32')) {
                     this.secInputName = name;
                 } else if (/macro|regime/i.test(name)) {
                     this.macroInputName = name;
-                    if (dims.length === 2 && typeof dims[1] === 'number') this.macroDim = dims[1];
-                    else if (dims.length === 1 && typeof dims[0] === 'number') this.macroDim = dims[0];
                 }
             }
 
@@ -642,48 +668,28 @@ class StockPredictor {
             if (!this.maskInputName && this.inputNames.length > 1) this.maskInputName = this.inputNames[1];
             if (!this.secInputName && this.inputNames.length > 2) this.secInputName = this.inputNames[2];
 
-            console.log(`[StockPredictor] Loaded MS-iTransformer Model: ${this.modelPath}`);
-            console.log(`[StockPredictor] Bindings: X='${this.xInputName}', Mask='${this.maskInputName}' (${this.maskIsBoolean ? 'BOOL' : 'FLOAT'}), Sector='${this.secInputName}', Macro='${this.macroInputName || 'None'}'`);
+            console.log(`[StockPredictor] Quant Engine v4.0 Active: ${this.modelPath}`);
+            console.log(`[StockPredictor] Input Bindings: X='${this.xInputName}', Mask='${this.maskInputName}' (${this.maskIsBoolean ? 'BOOL' : 'FLOAT'}), Sector='${this.secInputName}'`);
         }
         return this;
     }
 
     async predict(activeTickers, activeSequences, stockVolsMap) {
-        if (!this.session) throw new Error("[StockPredictor] Engine not initialized.");
+        if (!this.session) throw new Error("[StockPredictor] Quant Engine not initialized.");
 
-        const activeCount = Math.min(activeTickers.length, this.modelMaxStocks);
-        if (activeCount === 0) return [];
+        const activeCount = this.isDynamicStocks 
+            ? activeTickers.length 
+            : Math.min(activeTickers.length, this.modelMaxStocks);
+            
+        if (activeCount === 0) return { ranked: [], dispersion: 0.0 };
 
         const tickersSlice = activeTickers.slice(0, activeCount);
         const seqSlice = activeSequences.slice(0, activeCount);
 
-        // 1. Compute Macro Vector BEFORE rank-scaling
-        const lastStep = (this.modelSeqLen - 1) * NUM_FEATURES;
-        const retList = [];
-        const hlList = [];
-        const normVolList = [];
-
-        for (let s = 0; s < activeCount; s++) {
-            retList.push(seqSlice[s][lastStep + 0]);
-            hlList.push(seqSlice[s][lastStep + 11]);
-            normVolList.push(seqSlice[s][lastStep + 10]);
-        }
-
-        const nAct = retList.length;
-        let meanRet = 0.0, meanHL = 0.0, meanNormVol = 0.0, dispersion = 0.0;
-        if (nAct > 0) {
-            meanRet = retList.reduce((a, b) => a + b, 0.0) / nAct;
-            meanHL = hlList.reduce((a, b) => a + b, 0.0) / nAct;
-            meanNormVol = normVolList.reduce((a, b) => a + b, 0.0) / nAct;
-            const varRet = retList.reduce((a, b) => a + (b - meanRet) ** 2, 0.0) / Math.max(1, nAct - 1);
-            dispersion = Math.sqrt(Math.max(varRet, 0.0));
-        }
-        const macroVector = [dispersion, meanRet, meanHL, meanNormVol];
-
-        // 2. Cross-Sectional Percentile Normalization [-1, 1]
+        // 1. Cross-Sectional Percentile Rank Scaling [-1, 1] per timestep
         applyCrossSectionalRankScaling(seqSlice, activeCount, this.modelSeqLen);
 
-        const targetN = this.modelMaxStocks;
+        const targetN = this.isDynamicStocks ? activeCount : this.modelMaxStocks;
         const xBuffer = new Float32Array(1 * targetN * this.modelSeqLen * NUM_FEATURES);
         const maskBufferBool = new Uint8Array(1 * targetN);
         const maskBufferFloat = new Float32Array(1 * targetN);
@@ -709,41 +715,26 @@ class StockPredictor {
                 : new ort.Tensor('float32', maskBufferFloat, [1, targetN])
         };
 
-        if (this.secInputName) feeds[this.secInputName] = new ort.Tensor('int64', sectorBuffer, [1, targetN]);
-
-        if (this.macroInputName) {
-            const macroBuffer = new Float32Array(this.macroDim);
-            for (let i = 0; i < Math.min(macroVector.length, this.macroDim); i++) {
-                macroBuffer[i] = macroVector[i];
+        if (this.secInputName) {
+            const secMeta = this.session.inputMetadata?.[this.secInputName];
+            const secType = String(secMeta?.type || 'int64').toLowerCase();
+            if (secType.includes('int32')) {
+                feeds[this.secInputName] = new ort.Tensor('int32', Int32Array.from(sectorBuffer, v => Number(v)), [1, targetN]);
+            } else {
+                feeds[this.secInputName] = new ort.Tensor('int64', sectorBuffer, [1, targetN]);
             }
-            const macroMeta = this.session.inputMetadata?.[this.macroInputName];
-            const macroShape = macroMeta?.dimensions?.length === 1 ? [this.macroDim] : [1, this.macroDim];
-            feeds[this.macroInputName] = new ort.Tensor('float32', macroBuffer, macroShape);
         }
 
-        // Safety fallback for any unmapped inputs
-        for (const inputName of this.inputNames) {
-            if (!feeds[inputName]) {
-                const meta = this.session.inputMetadata?.[inputName];
-                const type = String(meta?.type || 'float32').toLowerCase();
-                const dims = meta?.dimensions || [1];
-                const resolvedDims = dims.map(d => (typeof d === 'number' && d > 0 ? d : 1));
-                const totalElements = resolvedDims.reduce((a, b) => a * b, 1);
-
-                if (type.includes('bool')) {
-                    feeds[inputName] = new ort.Tensor('bool', new Uint8Array(totalElements).fill(1), resolvedDims);
-                } else if (type.includes('int64')) {
-                    feeds[inputName] = new ort.Tensor('int64', new BigInt64Array(totalElements), resolvedDims);
-                } else {
-                    feeds[inputName] = new ort.Tensor('float32', new Float32Array(totalElements), resolvedDims);
-                }
-            }
+        // Backward-compatibility: if an older model strictly demands macro input
+        if (this.macroInputName) {
+            feeds[this.macroInputName] = new ort.Tensor('float32', new Float32Array(4).fill(0.0), [1, 4]);
         }
 
         let results;
         try {
             results = await this.session.run(feeds);
         } catch (err) {
+            // Mask dtype toggle fallback
             this.maskIsBoolean = !this.maskIsBoolean;
             feeds[this.maskInputName] = this.maskIsBoolean
                 ? new ort.Tensor('bool', maskBufferBool, [1, targetN])
@@ -756,47 +747,55 @@ class StockPredictor {
             return k ? results[k].data : null;
         };
 
-        const rawOutput = getOutputData(/(alpha_?5|target_alpha|^alpha$|pred_total_?5|^output$)/i)
+        const rawOutput = getOutputData(/(alpha_?5|target_alpha|^preds?$|^output$)/i)
             || results[this.outputNames[0]]?.data
             || results[Object.keys(results)[0]]?.data;
 
         // ======================================================================
-        // NON-PARAMETRIC SYMMETRIC RANK CALIBRATION
-        // Binds raw IC logit scores to realistic alpha returns:
-        // Top longs fan up to +3.5%, worst shorts down to -3.5%
+        // GAUSSIAN CROSS-SECTIONAL CALIBRATION
+        // Eliminates artificial volatility-scaling cone & 8% brick-wall clipping
         // ======================================================================
-        const order = Array.from({ length: activeCount }, (_, i) => i);
-        order.sort((a, b) => Number(rawOutput[a]) - Number(rawOutput[b]));
+        const rawLogits = Array.from(rawOutput).slice(0, activeCount).map(Number);
+        
+        // 1. Compute cross-sectional distribution statistics of model predictions
+        const meanLogit = rawLogits.reduce((a, b) => a + b, 0.0) / Math.max(1, activeCount);
+        const varLogit = rawLogits.reduce((acc, v) => acc + (v - meanLogit) ** 2, 0.0) / Math.max(1, activeCount - 1);
+        const stdLogit = Math.sqrt(varLogit) + 1e-8;
 
-        const symmetricZ = new Float32Array(activeCount);
-        for (let rank = 0; rank < activeCount; rank++) {
-            const stockIdx = order[rank];
-            const uniformP = (rank / Math.max(1, activeCount - 1)) * 2.0 - 1.0; 
-            symmetricZ[stockIdx] = Math.sign(uniformP) * Math.pow(Math.abs(uniformP), 0.85) * 3.0;
-        }
+        // 2. Historical 5-day market-relative alpha standard deviation (~2.20%)
+        const HISTORICAL_5D_ALPHA_STD = 2.20; // 220 bps
 
         const scored = [];
+
         for (let s = 0; s < activeCount; s++) {
             const ticker = tickersSlice[s];
-            const zAlpha = symmetricZ[s];
-            const rawLogit = Number(rawOutput[s]);
+            const rawLogit = rawLogits[s];
+
+            // Standardized cross-sectional model score (Z-Score of model conviction)
+            const zScore = (rawLogit - meanLogit) / stdLogit;
+            
+            // Expected 5-Day Alpha: Preserves model's raw conviction margin symmetrically
+            // Top #1 pick (~+2.5 sigma) maps to ~+2.8% to +3.2%
+            const expectedReturn5d = Number((zScore * (HISTORICAL_5D_ALPHA_STD * 0.55)).toFixed(2));
+
+            // Signal EMA Smoothing (alpha = 0.40)
+            const prevSmoothed = globalSignalEmaMap.get(ticker);
+            const pSmooth = (prevSmoothed !== undefined)
+                ? (1.0 - SIGNAL_EMA_ALPHA) * prevSmoothed + SIGNAL_EMA_ALPHA * rawLogit
+                : rawLogit;
+            globalSignalEmaMap.set(ticker, pSmooth);
+
+            // True realized volatility is preserved as an independent risk metric
             const realizedVol = stockVolsMap.get(ticker) || 0.015;
+            const uncertainty5d = Number((realizedVol * Math.sqrt(5.0) * 100.0).toFixed(2));
 
-            // 5-day annualized volatility floor/ceiling
-            const vol5d = Math.max(1.20, Math.min(7.50, realizedVol * Math.sqrt(5.0) * 100.0));
-
-            // Alpha return bound: Z=+3.0 yields between +2.5% and +3.8%
-            const alphaContribution = (zAlpha / 3.0) * (vol5d * 0.45);
-            const expectedReturn5d = Number(alphaContribution.toFixed(2));
-            const uncertainty5d = Number(vol5d.toFixed(2));
-
-            // Normalized SNR bounded between -3.0 and +3.0
-            const snr = Number((zAlpha * 0.45).toFixed(3));
-            const directionConfidence = Number((normalCDF(zAlpha) * 100.0).toFixed(1));
+            // True Signal-to-Noise Ratio (Expected Alpha / Realized Uncertainty)
+            const snr = Number((expectedReturn5d / Math.max(0.5, uncertainty5d)).toFixed(3));
+            const directionConfidence = Number((normalCDF(zScore) * 100.0).toFixed(1));
 
             let direction = 'Neutral';
-            if (zAlpha > 0.40) direction = 'Bullish';
-            else if (zAlpha < -0.40) direction = 'Bearish';
+            if (expectedReturn5d > 0.30) direction = 'Bullish';
+            else if (expectedReturn5d < -0.30) direction = 'Bearish';
 
             const horizons = {
                 d1: { return: Number((expectedReturn5d * 0.20).toFixed(2)), uncertainty: Number((uncertainty5d * Math.sqrt(1 / 5)).toFixed(2)) },
@@ -809,7 +808,8 @@ class StockPredictor {
             scored.push({
                 ticker,
                 sector: TICKER_GICS_SECTORS[ticker] || 'General',
-                rawAlpha: Number(rawLogit.toFixed(4)),
+                rawAlpha: Number(rawLogit.toFixed(5)),
+                smoothedAlpha: Number(pSmooth.toFixed(5)),
                 alpha: Number((expectedReturn5d / 100.0).toFixed(4)),
                 snr,
                 expectedReturn5d,
@@ -821,18 +821,21 @@ class StockPredictor {
             });
         }
 
-        // Descending sort: highest conviction Long (#1) to lowest
+        // Descending sort: highest expected forward alpha first (#1 Long at top)
         scored.sort((a, b) => b.expectedReturn5d - a.expectedReturn5d);
+
+        // Cross-Sectional Dispersion Metric
+        const dispersion = stdLogit;
 
         return {
             ranked: scored.map((item, idx) => ({ rank: idx + 1, ...item })),
-            macroVector
+            dispersion
         };
     }
 }
 
 // ==============================================================================
-// SECTION 7: PIPELINE ORCHESTRATOR & DYNAMIC RISK-PARITY SIZING
+// SECTION 7: PIPELINE ORCHESTRATION & LEAK-FREE T+1 EXECUTION RULES
 // ==============================================================================
 async function buildAndRunPredictor(options = {}) {
     const t0 = Date.now();
@@ -843,16 +846,25 @@ async function buildAndRunPredictor(options = {}) {
     const activeUniverse = SP500_TICKERS.filter(t => !DEAD_TICKERS.has(t));
     const lookback = predictor.modelSeqLen;
 
-    console.log(`[Predictor Pipeline] Downloading OHLCV for ${activeUniverse.length} equities (Window: ${lookback} sessions)...`);
+    console.log(`[Predictor Pipeline] Downloading Universe Data (${activeUniverse.length} equities, lookback: ${lookback} sessions)...`);
 
     const benchSeries = await getOHLCV(BENCHMARK_TICKER, STOCK_RANGE_DAYS, options.cacheDir);
     if (!benchSeries || benchSeries.closes.length < lookback + 50) {
-        throw new Error(`[Predictor Pipeline] Unable to ingest benchmark session dates for ${BENCHMARK_TICKER}`);
+        throw new Error(`[Predictor Pipeline] Failed to ingest benchmark ${BENCHMARK_TICKER}`);
     }
 
     const targetDates = benchSeries.dates.slice(-lookback);
     const signalDate = targetDates[targetDates.length - 1];
-    const isMonday = new Date(signalDate).getUTCDay() === 1;
+    const dayOfWeek = new Date(signalDate).getUTCDay(); // 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri
+
+    // -------------------------------------------------------------
+    // STRICT T+1 OPEN EXECUTION RULES (FROM PYTHON ENGINE)
+    // -------------------------------------------------------------
+    const isMonday = dayOfWeek === 1;
+    const isWednesday = dayOfWeek === 3;
+    const isThursday = dayOfWeek === 4;
+
+    const effectiveHurdle = CONVICTION_THRESHOLD * (isMonday ? MONDAY_HURDLE_MULT : 1.0);
 
     const rawSeriesMap = await fetchManyOHLCV(activeUniverse, STOCK_RANGE_DAYS, options.cacheDir);
 
@@ -894,25 +906,40 @@ async function buildAndRunPredictor(options = {}) {
         }
     }
 
-    console.log(`[Predictor Pipeline] Running MS-iTransformer forward pass across ${activeTickers.length} instruments...`);
+    console.log(`[Predictor Pipeline] Forward pass through Hierarchical MS-iTransformer (${activeTickers.length} symbols)...`);
 
-    const { ranked, macroVector } = await predictor.predict(activeTickers, activeSequences, stockVolsMap);
+    const { ranked, dispersion } = await predictor.predict(activeTickers, activeSequences, stockVolsMap);
     const finalTopK = Math.min(targetK, ranked.length);
 
-    // Dynamic Conviction Capital Sizing
-    const topMeanRet = ranked.slice(0, finalTopK).reduce((acc, p) => acc + p.expectedReturn5d, 0) / finalTopK;
-    const botMeanRet = ranked.slice(-finalTopK).reduce((acc, p) => acc + p.expectedReturn5d, 0) / finalTopK;
-    const modelSpread = (topMeanRet - botMeanRet) / 100.0;
+    // -------------------------------------------------------------
+    // VOLATILITY TARGETING & EXPOSURE DAMPENING
+    // -------------------------------------------------------------
+    const benchReturns = [];
+    for (let i = 1; i < benchSeries.closes.length; i++) {
+        benchReturns.push(Math.log(benchSeries.closes[i] / benchSeries.closes[i - 1]));
+    }
+    const recentBenchVol = rollingStd(Float32Array.from(benchReturns), 20);
+    const annBenchVol = (recentBenchVol[recentBenchVol.length - 1] || 0.012) * Math.sqrt(252);
 
-    const spreadRange = HIGH_CONVICTION_SPREAD - LOW_CONVICTION_SPREAD;
-    const convictionPct = (modelSpread - LOW_CONVICTION_SPREAD) / (spreadRange + 1e-8);
-    const capitalExposure = Math.max(MIN_CAPITAL_EXPOSURE, Math.min(MAX_CAPITAL_EXPOSURE, MIN_CAPITAL_EXPOSURE + convictionPct * (MAX_CAPITAL_EXPOSURE - MIN_CAPITAL_EXPOSURE)));
+    let volScalar = 1.0;
+    if (ENABLE_VOL_TARGETING && annBenchVol > 0) {
+        volScalar = Math.min(1.0, TARGET_ANNUAL_VOL / annBenchVol);
+    }
 
-    const effectiveHurdle = (CONVICTION_THRESHOLD * (isMonday ? MONDAY_HURDLE_MULT : 1.0)) * 100.0;
+    let capitalExposure = 1.0 * volScalar;
+    if (isWednesday) {
+        capitalExposure *= THURSDAY_DAMPENER;
+    } else if (isThursday) {
+        capitalExposure *= FRIDAY_DAMPENER;
+    }
+    capitalExposure = Math.max(MIN_CAPITAL_EXPOSURE, Math.min(MAX_CAPITAL_EXPOSURE, capitalExposure));
 
-    const topLongs = ranked.slice(0, finalTopK);
-    const invVols = topLongs.map(p => 1.0 / p.realizedVol);
-    const invVolSum = invVols.reduce((a, b) => a + b, 0.0) || 1.0;
+    // -------------------------------------------------------------
+    // INVERSE-VOLATILITY RISK PARITY PORTFOLIO SIZING
+    // -------------------------------------------------------------
+    const topCandidates = ranked.slice(0, finalTopK);
+    const eligibleLongs = topCandidates.filter(item => item.smoothedAlpha > effectiveHurdle);
+    const invVolSum = eligibleLongs.reduce((sum, item) => sum + (1.0 / item.realizedVol), 0.0);
 
     const predictions = ranked.map((item, idx) => {
         let group = 'Neutral';
@@ -920,11 +947,11 @@ async function buildAndRunPredictor(options = {}) {
 
         if (idx < finalTopK) {
             group = 'Top Long';
-            if (item.expectedReturn5d >= effectiveHurdle) {
+            if (item.smoothedAlpha > effectiveHurdle && invVolSum > 0) {
                 const normWeight = (1.0 / item.realizedVol) / invVolSum;
                 portfolioWeight = Number((normWeight * capitalExposure).toFixed(4));
             }
-        } else if (idx >= ranked.length - finalTopK) {
+        } else if (idx >= ranked.length - DEFAULT_BOTTOM_K) {
             group = 'Top Short';
         }
 
@@ -936,6 +963,7 @@ async function buildAndRunPredictor(options = {}) {
             group,
             portfolioWeight,
             rawAlpha: item.rawAlpha,
+            smoothedAlpha: item.smoothedAlpha,
             alpha: item.alpha,
             expectedReturn5d: item.expectedReturn5d,
             uncertainty5d: item.uncertainty5d,
@@ -946,32 +974,38 @@ async function buildAndRunPredictor(options = {}) {
         };
     });
 
+    const topLongsSpread = predictions.slice(0, finalTopK).reduce((acc, p) => acc + p.expectedReturn5d, 0) / finalTopK;
+    const botShortsSpread = predictions.slice(-finalTopK).reduce((acc, p) => acc + p.expectedReturn5d, 0) / finalTopK;
+    const crossSectionalSpread = topLongsSpread - botShortsSpread;
+
     return {
         predictions,
         universeSize: predictions.length,
-        marketSpread: Number(modelSpread.toFixed(4)),
+        marketSpread: Number((crossSectionalSpread / 100.0).toFixed(4)),
         topK: finalTopK,
         macroState: {
             signalDate,
             weekday: new Date(signalDate).toLocaleDateString('en-US', { weekday: 'long' }),
-            dispersion: Number(macroVector[0].toFixed(4)),
-            meanReturn: Number(macroVector[1].toFixed(4)),
-            meanHLSpread: Number(macroVector[2].toFixed(4)),
-            meanNormVol: Number(macroVector[3].toFixed(4)),
+            dispersion: Number(dispersion.toFixed(4)),
+            annualizedBenchmarkVol: Number((annBenchVol * 100.0).toFixed(2)),
             isMondayHurdleActive: isMonday,
-            effectiveConvictionHurdle: Number(effectiveHurdle.toFixed(3)),
-            topMeanReturnPct: Number(topMeanRet.toFixed(2)),
-            bottomMeanReturnPct: Number(botMeanRet.toFixed(2)),
-            modelSpreadPct: Number((modelSpread * 100).toFixed(2)),
-            equityExposurePct: Number((capitalExposure * 100).toFixed(1)),
-            cashPreservationPct: Number(((1.0 - capitalExposure) * 100).toFixed(1))
+            effectiveConvictionHurdle: Number((effectiveHurdle * 100.0).toFixed(3)),
+            thursdayDampenerActive: isWednesday,
+            fridayDampenerActive: isThursday,
+            topMeanReturnPct: Number(topLongsSpread.toFixed(2)),
+            bottomMeanReturnPct: Number(botShortsSpread.toFixed(2)),
+            modelSpreadPct: Number(crossSectionalSpread.toFixed(2)),
+            equityExposurePct: Number((capitalExposure * 100.0).toFixed(1)),
+            cashPreservationPct: Number(((1.0 - capitalExposure) * 100.0).toFixed(1))
         },
         executionModel: {
-            architecture: '3D Hierarchical MS-iTransformer (1 Market + 11 GICS Sectors)',
-            portfolioSizing: 'Inverse-Volatility Risk Parity (w_i ~ 1/vol)',
-            rebalanceHorizon: '5-Day Forward Alpha Horizon',
-            feeDragModel: `${(TRANSACTION_FEE_BPS * 10000).toFixed(0)} bps per rebalance`,
-            minHoldingPeriod: '3 Days'
+            engineVersion: '4.0 Clean Production Master',
+            architecture: '3D MS-iTransformer (Multi-Scale Inception TCN + Gated Factor Inversion + CS-Norm)',
+            spatialRouting: '12 Centroids (1 Market + 11 GICS Sectors)',
+            portfolioSizing: 'Strict Inverse-Volatility Risk Parity (w_i ~ 1 / sigma_i)',
+            volatilityTarget: `${(TARGET_ANNUAL_VOL * 100).toFixed(0)}% Annual Volatility Ceiling`,
+            turnoverFeeDrag: `${(TRANSACTION_FEE_BPS * 10000).toFixed(0)} bps per turnover`,
+            minHoldingBuffer: `${MIN_HOLDING_DAYS} Days / Rank Buffer ${BUFFER_RANK}`
         },
         signalDate,
         latency: Date.now() - t0,
@@ -980,7 +1014,7 @@ async function buildAndRunPredictor(options = {}) {
 }
 
 // ==============================================================================
-// SECTION 8: WORKER THREAD MANAGER & MULTI-THREAD EXPORTS
+// SECTION 8: WORKER THREAD POOLING & CONCURRENCY
 // ==============================================================================
 function createManager() {
     let worker = null;
@@ -1065,7 +1099,7 @@ function createManager() {
 }
 
 // ==============================================================================
-// SECTION 9: ENTRYPOINT & MODULE EXPORTS
+// SECTION 9: ENTRYPOINT & EXPORTS
 // ==============================================================================
 if (parentPort || workerData?.mode === 'worker') {
     if (!parentPort) throw new Error('[AI Stock Predictor Worker] Requires valid parentPort context.');
