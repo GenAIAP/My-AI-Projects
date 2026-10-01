@@ -101,6 +101,7 @@ function buildPredictionHtmlReport(dataOrPredictions, topPctArg = 0.10, marketSp
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>S&P 500 AI Quant Factor Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="/presence.js"></script>
     <script src="/socket.io/socket.io.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0b0f19; color: #f1f5f9; padding: 25px; margin: 0; }
@@ -333,7 +334,8 @@ function buildPredictionHtmlReport(dataOrPredictions, topPctArg = 0.10, marketSp
         document.getElementById('portfolioBudget').addEventListener('input', updateShareRecommendations);
 
         try {
-            socket = io();
+            socket = io(window.presenceSocketOptions());
+            window.watchForPresenceBans(socket);
             socket.on('connect', () => {
                 const b = document.getElementById('serverBadge');
                 b.textContent = 'LIVE SERVER';
