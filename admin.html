@@ -51,6 +51,7 @@
 		window.watchForPresenceBans(panelPresenceSocket);
 		const expandedUsers = new Set();
 		const siteBanDrafts = new Map();
+		const banScopeDrafts = new Map();
 		document.title = `${panelLabel} | Online users`;
 		document.getElementById('wordmark-mark').textContent = isModeratorPanel ? 'M' : 'A';
 		document.getElementById('wordmark-label').textContent = panelLabel.toUpperCase();
@@ -96,6 +97,20 @@
 					details.append(roleBadge);
 				}
 				details.append(connectedAt);
+				if (!isModeratorPanel && Array.isArray(user.ipAddresses)) {
+					const ipDisclosure = document.createElement('details');
+					ipDisclosure.className = 'ip-disclosure';
+					const ipSummary = document.createElement('summary');
+					ipSummary.textContent = 'Show IP';
+					ipDisclosure.addEventListener('toggle', () => {
+						ipSummary.textContent = ipDisclosure.open ? 'Hide IP' : 'Show IP';
+					});
+					const ipAddress = document.createElement('span');
+					ipAddress.className = 'ip-address';
+					ipAddress.textContent = user.ipAddresses.join(', ') || 'Unavailable';
+					ipDisclosure.append(ipSummary, ipAddress);
+					details.append(ipDisclosure);
+				}
 
 				const accessDetails = document.createElement('details');
 				accessDetails.className = 'site-access';
@@ -106,24 +121,48 @@
 				});
 				const summary = document.createElement('summary');
 				summary.textContent = 'Manage site access';
+				const scopeLabel = document.createElement('label');
+				scopeLabel.className = 'ban-scope-setting';
+				const scopeTitle = document.createElement('span');
+				scopeTitle.textContent = 'Ban target';
+				const scopeSelect = document.createElement('select');
+				for (const [value, label] of [
+					['local', 'This browser'],
+					['ip', 'IP address (all users sharing this address)']
+				]) {
+					const option = document.createElement('option');
+					option.value = value;
+					option.textContent = label;
+					scopeSelect.append(option);
+				}
+				scopeSelect.value = banScopeDrafts.get(user.id) || 'local';
+				scopeSelect.addEventListener('change', () => {
+					banScopeDrafts.set(user.id, scopeSelect.value);
+					refreshUsers();
+				});
+				scopeLabel.append(scopeTitle, scopeSelect);
 				const fieldset = document.createElement('fieldset');
 				const legend = document.createElement('legend');
 				legend.textContent = 'Access by site';
 				fieldset.append(legend);
-				const userDraft = siteBanDrafts.get(user.id);
+				const draftKey = `${user.id}:${scopeSelect.value}`;
+				const userDraft = siteBanDrafts.get(draftKey);
+				const banStatus = scopeSelect.value === 'ip'
+					? { sites: user.ipBannedSites, expiries: user.ipSiteBanExpiries }
+					: { sites: user.localBannedSites, expiries: user.localSiteBanExpiries };
 
 				for (const site of sites) {
 					const siteRow = document.createElement('div');
 					siteRow.className = 'site-option';
 					siteRow.dataset.site = site.path;
-					const expiry = Number(user.siteBanExpiries?.[site.path]);
+					const expiry = Number(banStatus.expiries?.[site.path]);
 					const remainingDuration = expiry > Date.now()
 						? Math.max(1, Math.ceil((expiry - Date.now()) / 1000))
 						: 30;
 					const savedDuration = userDraft?.get(site.path)?.duration ?? remainingDuration;
 					const isBanned = userDraft?.has(site.path)
 						? userDraft.get(site.path).banned
-						: user.bannedSites.includes(site.path);
+						: banStatus.sites.includes(site.path);
 					const siteName = document.createElement('span');
 					siteName.className = 'site-name';
 					siteName.textContent = site.label;
@@ -167,7 +206,7 @@
 								duration: Number(siteDuration.value) || 30
 							});
 						}
-						siteBanDrafts.set(user.id, draft);
+						siteBanDrafts.set(`${user.id}:${scopeSelect.value}`, draft);
 					};
 					banButton.addEventListener('click', () => {
 						banButton.dataset.banned = String(banButton.dataset.banned !== 'true');
@@ -201,25 +240,29 @@
 						const response = await fetch(`${panelBasePath}/users/${encodeURIComponent(user.id)}/site-bans`, {
 							method: 'POST',
 							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({ siteBans })
+							body: JSON.stringify({ siteBans, scope: scopeSelect.value })
 						});
 						if (response.status === 403) {
-							window.location.assign(panelBasePath);
-							return;
+							const result = await response.json();
+							if (result.error === 'Access denied') {
+								window.location.assign(panelBasePath);
+								return;
+							}
+							throw new Error(result.error || 'Access denied');
 						}
 						if (response.status === 404) {
 							await refreshUsers();
 							return;
 						}
 						if (!response.ok) throw new Error('Could not save site access');
-						siteBanDrafts.delete(user.id);
+						siteBanDrafts.delete(`${user.id}:${scopeSelect.value}`);
 						await refreshUsers();
-					} catch {
-						saveStatus.textContent = 'Could not save. Try again.';
+					} catch (error) {
+						saveStatus.textContent = error.message || 'Could not save. Try again.';
 						saveButton.disabled = false;
 					}
 				});
-				accessDetails.append(summary, fieldset, saveButton, saveStatus);
+					accessDetails.append(summary, scopeLabel, fieldset, saveButton, saveStatus);
 
 				const presence = document.createElement('span');
 				presence.className = 'presence';
